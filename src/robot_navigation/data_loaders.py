@@ -13,12 +13,16 @@ class Nav_Dataset(dataset.Dataset):
         data_path = Path(__file__).parent.parent.parent / "data" / "training_data.csv"
         self.data = np.genfromtxt(data_path, delimiter=',')
 
-        # normalize data and save scaler for inference
-        self.scaler = MinMaxScaler()
-        self.normalized_data = self.scaler.fit_transform(self.data) #fits and transforms
+        # Use StandardScaler instead of MinMaxScaler for better numerical stability
+        # StandardScaler (z-score normalization) is more robust to outliers and
+        # handles out-of-distribution values during inference better than MinMaxScaler
+        # IMPORTANT: Only normalize features (all columns except the last one which is the label)
+        self.scaler = StandardScaler()
+        features = self.data[:, :-1]  # All columns except last (label)
+        self.normalized_features = self.scaler.fit_transform(features)  # fits and transforms
         # Save scaler to models directory
         models_path = Path(__file__).parent.parent.parent / "models" / "scaler.pkl"
-        pickle.dump(self.scaler, open(models_path, "wb")) #save to normalize at inference
+        pickle.dump(self.scaler, open(models_path, "wb"))  # save to normalize at inference
 
     def __len__(self):
         return len(self.data)
@@ -26,9 +30,10 @@ class Nav_Dataset(dataset.Dataset):
     def __getitem__(self, idx):
         if not isinstance(idx, int):
             idx = idx.item()
-        # Use actual training data instead of dummy values
-        n = self.normalized_data[idx, 0:-1]
-        y = self.normalized_data[idx, [-1]]
+        # Use normalized features but ORIGINAL labels (0 or 1)
+        # Labels should NOT be normalized for binary classification!
+        n = self.normalized_features[idx]  # All features (already excludes label)
+        y = self.data[idx, [-1]]  # Use original labels, not normalized
 
         x_tensor = torch.from_numpy(n).float()
         y_tensor = torch.from_numpy(y).float()

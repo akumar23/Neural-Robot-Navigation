@@ -3,5 +3,5 @@ numpy
 noise
 torch
 matplotlib
-sklearn
-torch
+scikit-learn
+pygame

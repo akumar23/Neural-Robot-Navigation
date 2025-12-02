@@ -7,6 +7,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from src.robot_navigation.steering import Wander, Seek
 from src.robot_navigation import simulation as sim
 from src.robot_navigation.networks import Action_Conditioned_FF
+from src.robot_navigation.feature_engineering import engineer_features
 
 import pickle
 import numpy as np
@@ -15,10 +16,23 @@ import numpy.linalg as la
 
 
 def get_network_param(sim_env, action, scaler):
+    """
+    Get network input with feature engineering.
+
+    Creates feature vector with raw sensors + derived features + action,
+    then normalizes using the saved scaler.
+    """
     sensor_readings = sim_env.raycasting()
-    network_param = np.append(sensor_readings, [action, 0]) #unutilized 0 added to match shape of scaler
-    network_param = scaler.transform(network_param.reshape(1,-1))
-    network_param = network_param.flatten()[:-1]
+
+    # Use feature engineering to create enhanced feature vector
+    # Features: [5 raw sensors] + [6 derived features] + [action] = 12 features
+    features = engineer_features(sensor_readings, action)
+
+    # Add dummy collision label (0) to match scaler shape, then remove after transform
+    features_with_label = np.append(features, 0)
+    normalized = scaler.transform(features_with_label.reshape(1, -1))
+    network_param = normalized.flatten()[:-1]  # Remove the collision label
+
     network_param = torch.as_tensor(network_param, dtype=torch.float32)
     return network_param
 

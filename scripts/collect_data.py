@@ -6,6 +6,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from src.robot_navigation.steering import Wander
 from src.robot_navigation import simulation as sim
+from src.robot_navigation.feature_engineering import engineer_features
 
 import numpy as np
 
@@ -18,13 +19,12 @@ def collect_training_data(total_actions):
     action_repeat = 100
     steering_behavior = Wander(action_repeat)
 
-    num_params = 7
-
     network_params = []
 
     for action_i in range(total_actions):
         progress = 100 * float(action_i) / total_actions
-        #print(f'Collecting Training Data {progress}%   ', end="\r", flush=True)
+        if action_i % 1000 == 0:
+            print(f'Collecting Training Data {progress:.1f}%', flush=True)
 
         # steering_force is used for robot control only
         action, steering_force = steering_behavior.get_action(action_i, sim_env.robot.body.angle)
@@ -41,16 +41,13 @@ def collect_training_data(total_actions):
                 if action_timestep < action_repeat * .3:  # in case prior action caused collision
                     network_params[-1][-1] = collision  # share collision result with prior action
                 break
-        print(sensor_readings)
-        print(action)
-        print(collision)
-        sensor_readings = np.append(sensor_readings, action)
-        sensor_readings = np.append(sensor_readings, collision)
-        print(sensor_readings)
-        print(action)
-        print(collision)
 
-        network_params.append(sensor_readings)
+        # Use feature engineering to create enhanced feature vector
+        # Features: [5 raw sensors] + [6 derived features] + [action] + [collision]
+        features = engineer_features(sensor_readings, action)
+        features = np.append(features, collision)  # Add collision label
+
+        network_params.append(features)
 
     # Save to data directory
     data_path = Path(__file__).parent.parent / "data" / "training_data.csv"

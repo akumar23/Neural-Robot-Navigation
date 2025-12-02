@@ -35,6 +35,12 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from src.robot_navigation.steering import Seek
 from src.robot_navigation import simulation as sim
 from src.robot_navigation.networks import Action_Conditioned_FF
+from src.robot_navigation.feature_engineering import engineer_features
+from src.robot_navigation.action_smoother import ActionSmoother
+from src.robot_navigation.spatial_memory import SpatialMemory
+from src.robot_navigation.wall_follower import WallFollower
+from src.robot_navigation.openness_scorer import OpennessScorer
+from src.robot_navigation.waypoint_planner import WaypointPlanner
 
 import pickle
 import numpy as np
@@ -48,10 +54,22 @@ sim.HEADLESS = True
 
 
 def get_network_param(sim_env, action, scaler):
+    """
+    Get network input with feature engineering.
+
+    Creates feature vector with raw sensors + derived features + action,
+    then normalizes using the saved scaler.
+    """
     sensor_readings = sim_env.raycasting()
-    network_param = np.append(sensor_readings, [action, 0])
-    network_param = scaler.transform(network_param.reshape(1,-1))
-    network_param = network_param.flatten()[:-1]
+
+    # Use feature engineering to create enhanced feature vector
+    # Features: [5 raw sensors] + [6 derived features] + [action] = 12 features
+    features = engineer_features(sensor_readings, action)
+
+    # Scaler was trained only on features (not labels), so we can transform directly
+    normalized = scaler.transform(features.reshape(1, -1))
+    network_param = normalized.flatten()
+
     network_param = torch.as_tensor(network_param, dtype=torch.float32)
     return network_param
 
@@ -80,6 +98,21 @@ def test_robot_movement(max_iterations=1000, goals_to_reach=2, verbose=True):
 
     # Load normalization parameters
     scaler = pickle.load(open(models_path / "scaler.pkl", "rb"))
+
+    # Initialize action smoother to reduce oscillation
+    action_smoother = ActionSmoother(history_length=5, momentum_weight=0.4)
+
+    # Initialize spatial memory to prevent oscillation loops
+    spatial_memory = SpatialMemory(grid_size=30, decay_rate=0.97)
+
+    # Initialize wall follower for systematic escape behavior
+    wall_follower = WallFollower(target_distance=70, max_follow_steps=100)
+
+    # Initialize openness scorer for evaluating open space
+    openness_scorer = OpennessScorer(max_sensor_range=150)
+
+    # Initialize waypoint planner for intermediate targets
+    waypoint_planner = WaypointPlanner(waypoint_distance=120)
 
     # Tracking variables
     positions = []
@@ -133,7 +166,14 @@ def test_robot_movement(max_iterations=1000, goals_to_reach=2, verbose=True):
         current_position = sim_env.robot.body.position
         positions.append((current_position.x, current_position.y))
         goal_positions.append((sim_env.goal_body.position.x, sim_env.goal_body.position.y))
-        
+
+        # Add current position to spatial memory
+        spatial_memory.add_position(current_position)
+
+        # Decay spatial memory every 10 iterations
+        if iteration % 10 == 0:
+            spatial_memory.decay_visits()
+
         if distance_to_goal < 50:
             sim_env.move_goal()
             steering_behavior.update_goal(sim_env.goal_body.position)
@@ -141,14 +181,39 @@ def test_robot_movement(max_iterations=1000, goals_to_reach=2, verbose=True):
             collision_threshold = 0.3  # Reset threshold on goal reach
             no_progress_counter = 0
             last_distance_to_goal = float('inf')
+            action_smoother.reset()  # Clear action history on goal reach
+            spatial_memory.reset()  # Clear spatial memory on goal reach
+            wall_follower.reset()  # Reset wall following on goal reach
+            waypoint_planner.reset()  # Clear waypoints on goal reach
             if verbose:
                 print(f"Iteration {iteration}: Goal reached! ({goals_reached}/{goals_to_reach})")
             continue
 
+        # Get sensor readings for wall follower and waypoint planner
+        sensor_readings = sim_env.raycasting()
+
+        # Get navigation target (waypoint or goal) using waypoint planner
+        target = waypoint_planner.get_target(
+            sim_env.robot.body.position,
+            sim_env.robot.body.angle,
+            sim_env.goal_body.position,
+            sensor_readings
+        )
+
+        # Update steering behavior to seek the current target
+        steering_behavior.update_goal(target)
+
+        # Print waypoint status if using waypoint
+        if verbose and waypoint_planner.current_waypoint is not None:
+            print(f"Iteration {iteration}: Using waypoint at ({target[0]:.1f}, {target[1]:.1f})")
+
+        # Update wall follower state
+        wall_follower.update(sensor_readings, stuck_counter)
+
         action_space = np.arange(-5, 6)
         actions_available = []
         action_predictions = {}  # Store predictions for all actions
-        
+
         for action in action_space:
             network_param = get_network_param(sim_env, action, scaler)
             prediction = model(network_param)
@@ -161,9 +226,72 @@ def test_robot_movement(max_iterations=1000, goals_to_reach=2, verbose=True):
             if prediction_value < collision_threshold:
                 actions_available.append(action)
 
-        # Get desired action from steering behavior
+        # Get desired action from steering behavior (now pointing to target, not original goal)
         desired_action, _ = steering_behavior.get_action(sim_env.robot.body.position, sim_env.robot.body.angle)
-        
+
+        # Check if wall-following is active
+        if wall_follower.active:
+            # Get wall-following action
+            wall_action = wall_follower.get_wall_following_action(sensor_readings)
+
+            # Check if wall action is safe
+            if wall_action in actions_available:
+                closest_action = wall_action
+            else:
+                # Find closest safe action to wall action
+                if len(actions_available) > 0:
+                    closest_action = min(actions_available, key=lambda x: abs(x - wall_action))
+                else:
+                    # No safe actions - use wall action anyway (emergency)
+                    closest_action = wall_action
+
+            if verbose:
+                print(f"Iteration {iteration}: Wall-following active ({wall_follower.preferred_side}): action={closest_action}")
+
+            actions_taken.append(closest_action)
+            action_smoother.add_action(closest_action)
+            steering_force = steering_behavior.get_steering_force(closest_action, sim_env.robot.body.angle)
+
+            # Execute wall-following action
+            for action_timestep in range(action_repeat):
+                _, collision, _ = sim_env.step(steering_force)
+                if collision:
+                    total_collisions += 1
+                    collisions.append(iteration)
+                    stuck_counter = 0
+                    last_position = None
+                    action_smoother.reset()
+                    collision_threshold = min(0.6, collision_threshold + 0.05)
+                    break
+            continue
+
+        # Check for oscillation using spatial memory (only check every 5 iterations to avoid over-triggering)
+        if iteration % 5 == 0 and spatial_memory.detect_oscillation(current_position, window=20, threshold=60.0):
+            # Force a random strong action to break out of oscillation
+            strong_actions = [a for a in actions_available if abs(a) >= 3]
+            if strong_actions:
+                closest_action = np.random.choice(strong_actions)
+                if verbose:
+                    print(f"Iteration {iteration}: Spatial oscillation detected, forcing strong action: {closest_action}")
+                actions_taken.append(closest_action)
+                action_smoother.add_action(closest_action)
+                # Clear position history to give robot a fresh start
+                spatial_memory.position_history.clear()
+                steering_force = steering_behavior.get_steering_force(closest_action, sim_env.robot.body.angle)
+
+                # Execute forced action
+                for action_timestep in range(action_repeat):
+                    _, collision, _ = sim_env.step(steering_force)
+                    if collision:
+                        total_collisions += 1
+                        collisions.append(iteration)
+                        stuck_counter = 0
+                        last_position = None
+                        action_smoother.reset()
+                        collision_threshold = min(0.6, collision_threshold + 0.05)
+                        break
+                continue
+
         if len(actions_available) == 0:
             # If no actions are available, gradually increase threshold to allow more actions
             consecutive_no_actions += 1
@@ -171,15 +299,16 @@ def test_robot_movement(max_iterations=1000, goals_to_reach=2, verbose=True):
                 # Gradually increase threshold when stuck
                 collision_threshold = min(0.85, collision_threshold + 0.15)
                 consecutive_no_actions = 0
-            else:
-                # Pick actions with lowest collision predictions
-                valid_predictions = {k: v for k, v in action_predictions.items() if not np.isnan(v)}
-                if len(valid_predictions) == 0:
-                    valid_predictions = action_predictions
-                sorted_actions = sorted(valid_predictions.items(), key=lambda x: x[1])
-                # Take the top 5 safest actions (more options)
-                safest_actions = [a[0] for a in sorted_actions[:5]]
-                actions_available = safest_actions
+
+            # Always pick safest actions when none are available
+            # Pick actions with lowest collision predictions
+            valid_predictions = {k: v for k, v in action_predictions.items() if not np.isnan(v)}
+            if len(valid_predictions) == 0:
+                valid_predictions = action_predictions
+            sorted_actions = sorted(valid_predictions.items(), key=lambda x: x[1])
+            # Take the top 5 safest actions (more options)
+            safest_actions = [a[0] for a in sorted_actions[:5]]
+            actions_available = safest_actions
             
             turn_around_events.append(iteration)
             # Only turn around if we've been stuck for a while
@@ -187,6 +316,7 @@ def test_robot_movement(max_iterations=1000, goals_to_reach=2, verbose=True):
                 sim_env.turn_robot_around()
                 stuck_counter = 0
                 last_position = None
+                action_smoother.reset()  # Clear action history when turning around
                 collision_threshold = 0.5  # Reset to moderate threshold after turn
                 if verbose:
                     print(f"Iteration {iteration}: No safe actions, threshold={collision_threshold:.2f}, turning around")
@@ -199,27 +329,60 @@ def test_robot_movement(max_iterations=1000, goals_to_reach=2, verbose=True):
             # Gradually lower threshold back to conservative when we have safe actions
             if collision_threshold > 0.3:
                 collision_threshold = max(0.3, collision_threshold - 0.03)
-        
-        # Find the action closest to the desired steering direction
-        if len(actions_available) == 0:
-            # Should not happen, but handle it
-            closest_action = 0
-        else:
-            min_diff, closest_action = 9999, actions_available[0]
-            for a in actions_available:
-                diff = abs(desired_action - a)
-                if diff < min_diff:
-                    min_diff = diff
-                    closest_action = a
 
-        # Prefer non-zero actions if available
-        if closest_action == 0 and len(actions_available) > 1:
-            for a in actions_available:
-                if a != 0 and abs(action - a) <= min_diff + 1:
-                    closest_action = a
-                    break
+        # Apply spatial memory repulsion to action selection (only if we have actions)
+        # Calculate repulsion scores for each available action
+        action_scores = {}
+        if len(actions_available) > 0:
+            # Get openness scores for all available actions
+            openness_scores = openness_scorer.score_all_actions(actions_available, sensor_readings)
+
+            # Adaptive openness weight: increase when stuck to prioritize escape
+            openness_weight = 1.5 if stuck_counter > 3 else 0.8
+
+            robot_angle = sim_env.robot.body.angle
+            for action in actions_available:
+                # Estimate future position if we take this action
+                # action * 0.1 * pi gives the steering angle
+                action_angle = robot_angle + action * 0.1 * np.pi
+                # Estimate position ~30 pixels ahead in that direction
+                future_x = current_position.x + 30 * np.cos(action_angle)
+                future_y = current_position.y + 30 * np.sin(action_angle)
+                future_position = (future_x, future_y)
+
+                # Get repulsion score for estimated future position
+                repulsion = spatial_memory.get_repulsion_score(future_position)
+
+                # Calculate action desirability (closer to desired_action is better)
+                distance_from_desired = abs(action - desired_action)
+
+                # Get openness score for this action
+                openness = openness_scores[action]
+
+                # Score = preference for desired action - penalty for visited areas + openness bonus
+                # Higher score is better
+                score = -distance_from_desired - (repulsion * 2.0) + (openness * openness_weight)
+                action_scores[action] = score
+
+            # Detect thrashing and handle it
+            if action_smoother.detect_thrashing(threshold=3):
+                # Robot is oscillating - pick a random safe action with stronger turn
+                strong_actions = [a for a in actions_available if abs(a) >= 2]
+                if strong_actions:
+                    closest_action = np.random.choice(strong_actions)
+                    if verbose:
+                        print(f"Iteration {iteration}: Thrashing detected, forcing strong turn: {closest_action}")
+                else:
+                    # Fall back to smoother if no strong actions available
+                    closest_action = action_smoother.get_smoothed_action(actions_available, desired_action)
+            else:
+                # Select action with highest score (considering both desired direction and spatial repulsion)
+                best_action = max(action_scores.items(), key=lambda x: x[1])[0]
+                # Use action smoother to smooth the spatially-aware action
+                closest_action = action_smoother.get_smoothed_action(actions_available, best_action)
 
         actions_taken.append(closest_action)
+        action_smoother.add_action(closest_action)  # Record the action taken
         steering_force = steering_behavior.get_steering_force(closest_action, sim_env.robot.body.angle)
         
         # Check if robot is stuck
@@ -232,6 +395,7 @@ def test_robot_movement(max_iterations=1000, goals_to_reach=2, verbose=True):
                     sim_env.turn_robot_around()
                     stuck_counter = 0
                     last_position = None
+                    action_smoother.reset()  # Clear action history when stuck
                     collision_threshold = 0.5  # Reset threshold
                     if verbose:
                         print(f"Iteration {iteration}: Robot stuck, forcing turn")
@@ -248,6 +412,7 @@ def test_robot_movement(max_iterations=1000, goals_to_reach=2, verbose=True):
                 collisions.append(iteration)
                 stuck_counter = 0
                 last_position = None
+                action_smoother.reset()  # Clear action history on collision
                 # Slightly increase threshold after collision to be more permissive
                 collision_threshold = min(0.6, collision_threshold + 0.05)
                 break
