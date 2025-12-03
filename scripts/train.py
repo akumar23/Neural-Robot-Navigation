@@ -28,7 +28,8 @@ def calculate_collision_rate(data_loaders):
 def train_model(no_epochs):
     batch_size = 32
     data_loaders = Data_Loaders(batch_size)
-    model = Action_Conditioned_FF()
+    # Update model to use 20D input features (5 sensors + 6 spatial + 2 goal + 4 temporal + 2 spatial-goal + 1 action)
+    model = Action_Conditioned_FF(input_size=20)
 
     # Calculate collision rate for Focal Loss alpha parameter
     collision_rate = calculate_collision_rate(data_loaders)

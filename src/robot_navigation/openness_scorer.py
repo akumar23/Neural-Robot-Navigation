@@ -38,6 +38,9 @@ class OpennessScorer:
         Returns:
             np.array: Weights for sensors [0, 1, 2, 3, 4]
         """
+        from .navigation_config import NavigationConfig
+        config = NavigationConfig()
+
         # Base weights (all sensors contribute)
         weights = np.array([1.0, 1.0, 1.0, 1.0, 1.0])
 
@@ -69,7 +72,7 @@ class OpennessScorer:
             weights[4] = 1.5 + turn_strength * 1.0  # Right-far sensor (66°)
 
         # Ensure no negative weights
-        weights = np.maximum(weights, 0.1)
+        weights = np.maximum(weights, config.openness_min_weight)
 
         return weights
 

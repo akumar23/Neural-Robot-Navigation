@@ -9,6 +9,7 @@ from src.robot_navigation import simulation as sim
 from src.robot_navigation.feature_engineering import engineer_features
 
 import numpy as np
+from collections import deque
 
 
 def collect_training_data(total_actions):
@@ -20,6 +21,9 @@ def collect_training_data(total_actions):
     steering_behavior = Wander(action_repeat)
 
     network_params = []
+
+    # Track action history for temporal features (last 5 actions)
+    action_history = deque(maxlen=5)
 
     for action_i in range(total_actions):
         progress = 100 * float(action_i) / total_actions
@@ -42,10 +46,28 @@ def collect_training_data(total_actions):
                     network_params[-1][-1] = collision  # share collision result with prior action
                 break
 
-        # Use feature engineering to create enhanced feature vector
-        # Features: [5 raw sensors] + [6 derived features] + [action] + [collision]
-        features = engineer_features(sensor_readings, action)
-        features = np.append(features, collision)  # Add collision label
+        # Get robot state for enhanced features
+        robot_pos = sim_env.robot.body.position
+        robot_angle = sim_env.robot.body.angle
+        goal_pos = sim_env.goal_body.position
+        velocity = sim_env.robot.body.velocity
+
+        # Use enhanced feature engineering to create 20D feature vector
+        # Features: [5 sensors] + [6 spatial] + [2 goal] + [4 temporal] + [2 spatial-goal] + [action] = 20
+        features = engineer_features(
+            sensor_readings, action,
+            robot_pos=robot_pos,
+            robot_angle=robot_angle,
+            goal_pos=goal_pos,
+            velocity=velocity,
+            action_history=action_history
+        )
+
+        # Add action to history after using it (for next iteration)
+        action_history.append(action)
+
+        # Add collision label to features (20 features + 1 label = 21 columns)
+        features = np.append(features, collision)
 
         network_params.append(features)
 
@@ -53,12 +75,17 @@ def collect_training_data(total_actions):
     data_path = Path(__file__).parent.parent / "data" / "training_data.csv"
     np.savetxt(data_path, network_params, delimiter=",")
 
+    # Verify dimensions
+    print(f"\nData collection complete!")
+    print(f"Total samples: {len(network_params)}")
+    print(f"Features per sample: {len(network_params[0])} (20 features + 1 collision label)")
+
 
 if __name__ == '__main__':
-    # Collect more training data for better model accuracy
-    # Current: 50,000 samples, increasing to 100,000 for better coverage
+    # Collect training data for model accuracy
+    # Using 100,000 samples for full dataset (as per requirements)
     total_actions = 100000
-    print(f"Collecting {total_actions} training samples...")
+    print(f"Collecting {total_actions} training samples with enhanced features (20D)...")
     print("This may take a while. Progress will be shown.")
     collect_training_data(total_actions)
     print(f"\nTraining data collection complete! Collected {total_actions} samples.")

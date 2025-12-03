@@ -13,7 +13,7 @@ import matplotlib.pyplot as plt
 
 
 
-HEADLESS = False
+HEADLESS = True
 if HEADLESS:
     import os
     os.environ['SDL_VIDEODRIVER'] = 'dummy'
@@ -62,12 +62,15 @@ ALL_COLORS = [BLACK,WHITE,RED,LIME,BLUE,YELLOW,CYAN,MAGENTA,SILVER,GRAY,MAROON,O
 
 class Robot:
     def __init__(self, mass=1, pos=(0,0), ori=0):
+        from .navigation_config import NavigationConfig
+        config = NavigationConfig()
+
         self.mass = mass
         # self.max_speed = 15
-        self.speed = 20
-        self.max_steering_force = 1
+        self.speed = config.robot_speed
+        self.max_steering_force = config.robot_max_steering_force
         self.max_turn_radians = math.pi/800
-        self.friction = .05
+        self.friction = config.robot_friction
 
         self.body, self.shape = self.create_pymunk_robot(self.mass)
         self.body.position = pos
@@ -78,7 +81,10 @@ class Robot:
         self.sensors, self.sensor_angles, self.sensor_range = self.add_sensors()
 
     def create_pymunk_robot(self, mass):
-        length, width = 20, 30
+        from .navigation_config import NavigationConfig
+        config = NavigationConfig()
+
+        length, width = config.robot_length, config.robot_width
         moment = pm.moment_for_box(mass, (length,width))
         body = pm.Body(mass, moment)
         corners = [ (-length,-width),
@@ -91,7 +97,12 @@ class Robot:
         shape.color = WHITE #TODO make bounding box invisible somehow
         return body, shape
 
-    def add_sensors(self, sensor_range=150.0):
+    def add_sensors(self, sensor_range=None):
+        from .navigation_config import NavigationConfig
+        config = NavigationConfig()
+
+        if sensor_range is None:
+            sensor_range = config.robot_sensor_range
         self.sensor_range = sensor_range
         sensor_shapes = []
         sensor_end_points = []
@@ -112,9 +123,12 @@ class Robot:
 
 class SimulationEnvironment:
     def __init__(self):
+        from .navigation_config import NavigationConfig
+        config = NavigationConfig()
+
         self.sim_steps = 0 # counter incremented each step for debug
         pg.init()
-        self.screen_width, self.screen_height = 1080, 900
+        self.screen_width, self.screen_height = config.simulation_screen_width, config.simulation_screen_height
         self.screen = pg.display.set_mode((self.screen_width, self.screen_height))
         # self.screen.fill(WHITE)
         pg.display.set_caption("PyGame Display")
@@ -125,14 +139,14 @@ class SimulationEnvironment:
 
         self.CENTER = (self.screen_width/2, self.screen_height/2)
         NORTH, SOUTH, EAST, WEST = math.pi/2, 3*math.pi/2, 0, math.pi # PLEASE ONLY USE EAST AT THIS TIME
-        self.robot = Robot(mass=20, pos=self.CENTER, ori=EAST)
+        self.robot = Robot(mass=config.robot_mass, pos=self.CENTER, ori=EAST)
 
         self.space.add(self.robot.body)
         self.space.add(self.robot.shape)
         for sensor_shape in self.robot.sensors:
             self.space.add(sensor_shape)
 
-        self.wall_shapes = self.assemble_walls(self.screen_width, self.screen_height, 180)
+        self.wall_shapes = self.assemble_walls(self.screen_width, self.screen_height, config.simulation_wall_unit)
         self.goal_body, self.goal_shape = self.add_goal()
         self.last_goal_position = -1
         self.move_goal()
@@ -140,9 +154,12 @@ class SimulationEnvironment:
 
 
     def add_goal(self):
+        from .navigation_config import NavigationConfig
+        config = NavigationConfig()
+
         body = pm.Body(1,1)
         body.position = 1000,80
-        radius = 40
+        radius = config.simulation_goal_radius
         shape = pm.Circle(body, radius)
         shape.color = BLUE
         shape.sensor = True
@@ -151,7 +168,10 @@ class SimulationEnvironment:
         return body, shape
 
     def move_goal(self):
-        offset=60
+        from .navigation_config import NavigationConfig
+        config = NavigationConfig()
+
+        offset = config.simulation_goal_offset
         i = random.randint(0,5)
         while i == self.last_goal_position:
             i = random.randint(0,5)
@@ -166,6 +186,35 @@ class SimulationEnvironment:
 
         self.goal_body.position = positions[i]
 
+    def reset(self):
+        """
+        Reset the robot position, velocity, and goal for a new episode.
+
+        Used for sequence data collection where each episode starts fresh.
+        Resets robot to center position facing east, zeros velocity,
+        and moves goal to new random position.
+        """
+        from .navigation_config import NavigationConfig
+        config = NavigationConfig()
+
+        EAST = 0  # Robot faces east (right)
+
+        # Reset robot position and orientation
+        self.robot.body.position = self.CENTER
+        self.robot.body.angle = EAST
+
+        # Zero out velocity and angular velocity
+        self.robot.body.velocity = Vec2d(0, 0)
+        self.robot.body.angular_velocity = 0
+
+        # Move goal to new random position
+        self.move_goal()
+
+        # Reset collision timer
+        self.time_since_collision = 0
+
+        # Reset simulation step counter
+        self.sim_steps = 0
 
     def assemble_walls(self, w, h, u):
         wall_shapes = []
@@ -307,6 +356,9 @@ class SimulationEnvironment:
 
 
     def _reset_robot(self, center=False, collision_points=None):
+        from .navigation_config import NavigationConfig
+        config = NavigationConfig()
+
         previous_angle = vector(self.robot.body.angle)
         previous_position = self.robot.body.position
 
@@ -318,28 +370,34 @@ class SimulationEnvironment:
         if center:
             self.robot.body.position = self.CENTER
         else:
-            self.robot.body.position = previous_position - (previous_angle * 25)
+            self.robot.body.position = previous_position - (previous_angle * config.simulation_reset_distance)
 
         self.robot.body.angular_velocity = 0
         self.robot.body.velocity = (0,0)
 
     def turn_robot_around(self):
+        from .navigation_config import NavigationConfig
+        config = NavigationConfig()
+
         previous_angle = vector(self.robot.body.angle)
         previous_position = self.robot.body.position
         steering_vector = -previous_angle + .01*np.random.randn(2)
 
         turn_len = random.randint(0,1)
         if turn_len == 0:
-            for i in range(180):
+            for i in range(config.simulation_turn_around_short):
                 self.step(steering_vector, ignore_collisions=True)
         else:
-            for i in range(250):
+            for i in range(config.simulation_turn_around_long):
                 self.step(steering_vector, ignore_collisions=True)
 
         self.robot.body.angular_velocity = 0
         self.robot.body.velocity = (0,0)
 
     def step(self, steering_direction, ignore_collisions=False):
+        from .navigation_config import NavigationConfig
+        config = NavigationConfig()
+
         pos, ori = self.robot.body.position, self.robot.body.angle
         state = np.array([pos[0], pos[1], ori], dtype=float)
         self._apply_robot_motion(steering_direction)
@@ -349,7 +407,7 @@ class SimulationEnvironment:
             if collision:
                 # Only reset to center if we've been stuck (colliding repeatedly)
                 # Otherwise, just back up a bit from the collision
-                if self.time_since_collision < 5:
+                if self.time_since_collision < config.simulation_collision_reset_threshold:
                     # If we've collided multiple times in quick succession, we might be stuck
                     # Just back up instead of resetting to center
                     self._reset_robot(collision_points=collision_points)

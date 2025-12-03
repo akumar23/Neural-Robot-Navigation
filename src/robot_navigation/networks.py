@@ -161,6 +161,185 @@ class Action_Conditioned_FF(nn.Module):
         avg_loss = total_loss / num_samples if num_samples > 0 else 0
         return avg_loss
 
+class Action_Conditioned_LSTM(nn.Module):
+    """
+    Action-Conditioned LSTM Network with Temporal Memory for Collision Detection.
+
+    Captures temporal dependencies in robot navigation by maintaining hidden state
+    across timesteps. This enables the model to learn temporal patterns like:
+    - Consequence of previous actions on current state
+    - Oscillation/thrashing detection
+    - Momentum and trajectory understanding
+    - Context-aware decision making based on action history
+
+    Architecture Design Decisions:
+    - LSTM vs GRU: Using LSTM for better long-term memory capability
+      - LSTM has separate cell state and hidden state for information flow
+      - Better at capturing long-range dependencies (important for escape behaviors)
+      - Slightly slower but more powerful than GRU
+    - Layers: 2 LSTM layers for hierarchical temporal feature learning
+      - Layer 1: Low-level temporal patterns (recent action effects)
+      - Layer 2: High-level temporal patterns (navigation strategies)
+    - Hidden size: 64 units (matching feedforward baseline for fair comparison)
+    - Dropout: 0.2 between LSTM layers and before output head
+
+    Args:
+        input_size: Number of input features (20 with enhanced features)
+        hidden_size: LSTM hidden state dimension (default: 64)
+        num_layers: Number of stacked LSTM layers (default: 2)
+        output_size: Output dimension (1 for binary collision prediction)
+        dropout: Dropout rate between LSTM layers (default: 0.2)
+    """
+    def __init__(self, input_size=20, hidden_size=64, num_layers=2, output_size=1, dropout=0.2):
+        super(Action_Conditioned_LSTM, self).__init__()
+
+        self.input_size = input_size
+        self.hidden_size = hidden_size
+        self.num_layers = num_layers
+        self.output_size = output_size
+
+        # LSTM layers with dropout between layers
+        # batch_first=True: input/output tensors are (batch, seq, feature)
+        self.lstm = nn.LSTM(
+            input_size=input_size,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            batch_first=True,
+            dropout=dropout if num_layers > 1 else 0  # Dropout only if multiple layers
+        )
+
+        # Output head: LSTM hidden state -> collision logit
+        # Use gradual dimensionality reduction for better feature extraction
+        self.output_head = nn.Sequential(
+            nn.LayerNorm(hidden_size),  # Normalize LSTM output
+            nn.Linear(hidden_size, hidden_size // 2),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_size // 2, output_size)
+        )
+        # Note: No sigmoid on output - FocalLoss includes sigmoid
+
+    def forward(self, x, hidden=None):
+        """
+        Forward pass with optional hidden state.
+
+        Supports both batch sequences (training) and single-step inference:
+        - Training: x is (batch, seq_len, features), processes full sequences
+        - Inference: x is (batch, 1, features) or (1, features), processes single timestep
+
+        Args:
+            x: Input tensor
+               Training: (batch, seq_len, features)
+               Inference: (batch, 1, features) or (features,) or (1, features)
+            hidden: Tuple of (h_0, c_0) hidden states, or None
+                   h_0: (num_layers, batch, hidden_size) - hidden state
+                   c_0: (num_layers, batch, hidden_size) - cell state
+                   If None, initialized to zeros
+
+        Returns:
+            output: Collision logits
+                   Training: (batch, seq_len, 1)
+                   Inference: (batch, 1) or scalar
+            hidden: Tuple of (h_n, c_n) updated hidden states
+        """
+        # Handle different input shapes for inference vs training
+        single_sample = False
+        single_timestep = False
+
+        if x.dim() == 1:
+            # Shape: (features,) -> add batch and sequence dimensions
+            x = x.unsqueeze(0).unsqueeze(0)  # (1, 1, features)
+            single_sample = True
+            single_timestep = True
+        elif x.dim() == 2:
+            # Could be (batch, features) or (1, features)
+            if x.size(0) == 1 or x.size(1) == self.input_size:
+                # Add sequence dimension: (batch, features) -> (batch, 1, features)
+                x = x.unsqueeze(1)
+                single_timestep = True
+        # else: x.dim() == 3, already (batch, seq_len, features)
+
+        # LSTM forward pass
+        # lstm_out: (batch, seq_len, hidden_size)
+        # hidden: tuple of (h_n, c_n), each (num_layers, batch, hidden_size)
+        lstm_out, hidden = self.lstm(x, hidden)
+
+        # Apply output head to all timesteps
+        # Reshape to (batch * seq_len, hidden_size) for linear layers
+        batch_size, seq_len, _ = lstm_out.shape
+        lstm_out_flat = lstm_out.reshape(batch_size * seq_len, self.hidden_size)
+
+        # Pass through output head
+        output = self.output_head(lstm_out_flat)
+
+        # Reshape back to (batch, seq_len, output_size)
+        output = output.reshape(batch_size, seq_len, self.output_size)
+
+        # Remove dimensions for single sample/timestep inference
+        if single_sample and single_timestep:
+            output = output.squeeze(0).squeeze(0)  # Scalar
+        elif single_timestep:
+            output = output.squeeze(1)  # (batch, output_size)
+
+        return output, hidden
+
+    def init_hidden(self, batch_size, device='cpu'):
+        """
+        Initialize hidden state to zeros.
+
+        Args:
+            batch_size: Batch size for hidden state
+            device: Device to create tensors on ('cpu' or 'cuda')
+
+        Returns:
+            Tuple of (h_0, c_0), each (num_layers, batch, hidden_size)
+        """
+        h_0 = torch.zeros(self.num_layers, batch_size, self.hidden_size, device=device)
+        c_0 = torch.zeros(self.num_layers, batch_size, self.hidden_size, device=device)
+        return (h_0, c_0)
+
+    def evaluate_sequences(self, model, test_loader, loss_function, device='cpu'):
+        """
+        Evaluate model on sequence data with proper masking of padded timesteps.
+
+        Args:
+            model: LSTM model
+            test_loader: DataLoader with sequences
+            loss_function: Loss function (e.g., FocalLoss)
+            device: Device to run on
+
+        Returns:
+            Average loss over all valid (non-padded) timesteps
+        """
+        model.eval()
+        total_loss = 0
+        num_valid_timesteps = 0
+
+        with torch.no_grad():
+            for batch in test_loader:
+                sequences = batch['input'].to(device)  # (batch, max_seq_len, features)
+                labels = batch['label'].to(device)      # (batch, max_seq_len)
+                lengths = batch['length']               # (batch,) - actual sequence lengths
+
+                # Forward pass
+                outputs, _ = model(sequences, hidden=None)  # (batch, max_seq_len, 1)
+                outputs = outputs.squeeze(-1)  # (batch, max_seq_len)
+
+                # Compute loss only on valid timesteps (not padding)
+                batch_size, max_seq_len = labels.shape
+                for i in range(batch_size):
+                    valid_len = lengths[i].item()
+                    # Loss on valid timesteps only
+                    valid_outputs = outputs[i, :valid_len]
+                    valid_labels = labels[i, :valid_len]
+                    loss = loss_function(valid_outputs, valid_labels)
+                    total_loss += loss.item() * valid_len
+                    num_valid_timesteps += valid_len
+
+        avg_loss = total_loss / num_valid_timesteps if num_valid_timesteps > 0 else 0
+        return avg_loss
+
+
 def main():
     model = Action_Conditioned_FF()
 

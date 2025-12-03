@@ -69,8 +69,8 @@ class WaypointPlanner:
         Determine if we need an intermediate waypoint.
 
         Use waypoint if:
-        - Goal is far away (> 200px) AND
-        - Direct path seems blocked (front sensor < 100 OR front + one side < 100)
+        - Goal is far away AND
+        - Direct path seems blocked
 
         Args:
             robot_pos: tuple or Vec2d (x, y)
@@ -79,6 +79,9 @@ class WaypointPlanner:
 
         Returns: bool
         """
+        from .navigation_config import NavigationConfig
+        config = NavigationConfig()
+
         # Convert to numpy arrays for distance calculation
         robot_pos_arr = np.array([robot_pos[0], robot_pos[1]])
         goal_pos_arr = np.array([goal_pos[0], goal_pos[1]])
@@ -87,7 +90,7 @@ class WaypointPlanner:
         distance_to_goal = la.norm(goal_pos_arr - robot_pos_arr)
 
         # Check if goal is far away
-        if distance_to_goal <= 200:
+        if distance_to_goal <= config.waypoint_min_goal_distance:
             return False
 
         # Check if direct path seems blocked
@@ -97,10 +100,11 @@ class WaypointPlanner:
         right_sensor = sensor_readings[3]  # -33 degrees
 
         # Path is blocked if:
-        # 1. Front sensor detects obstacle close (< 100)
-        # 2. OR front and one side are both detecting obstacles (combined < 100)
-        front_blocked = front_sensor < 100
-        sides_blocked = (front_sensor + left_sensor < 200) or (front_sensor + right_sensor < 200)
+        # 1. Front sensor detects obstacle close
+        # 2. OR front and one side are both detecting obstacles
+        front_blocked = front_sensor < config.waypoint_front_blocked_threshold
+        sides_blocked = ((front_sensor + left_sensor < config.waypoint_combined_sensor_threshold) or
+                        (front_sensor + right_sensor < config.waypoint_combined_sensor_threshold))
 
         return front_blocked or sides_blocked
 
@@ -144,6 +148,8 @@ class WaypointPlanner:
 
             # Score = openness + alignment bonus
             # Openness: higher sensor reading is better
+            from .navigation_config import NavigationConfig
+            config = NavigationConfig()
             openness_score = sensor_readings[i] / self.sensor_max_range
 
             # Alignment: prefer sensors pointing toward goal
@@ -151,7 +157,8 @@ class WaypointPlanner:
             alignment_score = np.cos(angle_diff)
 
             # Combined score (weight openness more heavily)
-            score = openness_score * 2.0 + alignment_score * 0.5
+            score = (openness_score * config.waypoint_openness_weight +
+                    alignment_score * config.waypoint_alignment_weight)
 
             if score > best_score:
                 best_score = score

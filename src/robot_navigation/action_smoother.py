@@ -66,7 +66,9 @@ class ActionSmoother:
             return 0  # Default to straight if no actions available
 
         # If we don't have enough history, just return closest to desired
-        if len(self.action_history) < 2:
+        from .navigation_config import NavigationConfig
+        config = NavigationConfig()
+        if len(self.action_history) < config.action_smoother_min_history_for_smoothing:
             min_diff = float('inf')
             closest_action = available_actions[0]
             for action in available_actions:

@@ -87,10 +87,12 @@ class SpatialMemory:
         Removes cells with count below 0.1 to keep memory efficient.
         """
         # Decay all visit counts
+        from .navigation_config import NavigationConfig
+        config = NavigationConfig()
         cells_to_remove = []
         for cell, count in self.visit_counts.items():
             new_count = count * self.decay_rate
-            if new_count < 0.1:
+            if new_count < config.spatial_memory_decay_min_count:
                 cells_to_remove.append(cell)
             else:
                 self.visit_counts[cell] = new_count

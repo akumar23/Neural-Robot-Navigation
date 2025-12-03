@@ -52,8 +52,8 @@ class WallFollower:
         Determine if wall-following should engage.
 
         Activate if:
-        - stuck_counter > 5 (robot is stuck)
-        - OR 3+ sensors detect walls < 80px (robot is in tight space)
+        - stuck_counter exceeds threshold (robot is stuck)
+        - OR multiple sensors detect walls below threshold (robot is in tight space)
 
         Args:
             sensor_readings: Array of 5 sensor readings in pixels
@@ -62,13 +62,16 @@ class WallFollower:
         Returns:
             bool: True if wall-following should activate
         """
+        from .navigation_config import NavigationConfig
+        config = NavigationConfig()
+
         # Check if robot is stuck
-        if stuck_counter > 5:
+        if stuck_counter > config.stuck_counter_wall_follow:
             return True
 
         # Check if multiple sensors detect close walls (tight space)
-        close_walls = np.sum(np.array(sensor_readings) < 80)
-        if close_walls >= 3:
+        close_walls = np.sum(np.array(sensor_readings) < config.wall_follower_close_wall_threshold)
+        if close_walls >= config.wall_follower_close_wall_count:
             return True
 
         return False
@@ -100,6 +103,9 @@ class WallFollower:
         right_near = sensor_readings[3] # -33° right
         right_far = sensor_readings[4]  # -66° right
 
+        from .navigation_config import NavigationConfig
+        config = NavigationConfig()
+
         action = 0  # Default to straight
 
         if self.preferred_side == 'right':
@@ -107,26 +113,26 @@ class WallFollower:
             wall_sensor = right_near  # Primary wall sensor
 
             # Front obstacle check - turn left sharply
-            if front < 80:
+            if front < config.wall_follower_front_blocked_threshold:
                 action = 5  # Sharp left turn
-            elif front < 110:
+            elif front < config.wall_follower_front_moderate_threshold:
                 action = 3  # Moderate left turn
-            # Wall distance control - use wider band (30px) to reduce oscillation
-            elif wall_sensor < self.target_distance - 30:
+            # Wall distance control - use wider band to reduce oscillation
+            elif wall_sensor < self.target_distance - config.wall_follower_distance_band:
                 # Too close to wall - turn left (away from wall)
                 action = 3
-            elif wall_sensor > self.target_distance + 30:
+            elif wall_sensor > self.target_distance + config.wall_follower_distance_band:
                 # Too far from wall - turn right (toward wall)
-                if wall_sensor > 130:
+                if wall_sensor > config.wall_follower_far_threshold:
                     action = -3  # Turn more sharply toward wall
                 else:
                     action = -2  # Gentle turn toward wall
             else:
                 # In good range - prefer straight with slight bias
                 # Only adjust if significantly off-center
-                if wall_sensor < self.target_distance - 15:
+                if wall_sensor < self.target_distance - config.wall_follower_distance_fine_adjust:
                     action = 1  # Slight left
-                elif wall_sensor > self.target_distance + 15:
+                elif wall_sensor > self.target_distance + config.wall_follower_distance_fine_adjust:
                     action = -1  # Slight right
                 else:
                     action = 0  # Go straight - reduces oscillation
@@ -136,26 +142,26 @@ class WallFollower:
             wall_sensor = left_near  # Primary wall sensor
 
             # Front obstacle check - turn right sharply
-            if front < 80:
+            if front < config.wall_follower_front_blocked_threshold:
                 action = -5  # Sharp right turn
-            elif front < 110:
+            elif front < config.wall_follower_front_moderate_threshold:
                 action = -3  # Moderate right turn
-            # Wall distance control - use wider band (30px) to reduce oscillation
-            elif wall_sensor < self.target_distance - 30:
+            # Wall distance control - use wider band to reduce oscillation
+            elif wall_sensor < self.target_distance - config.wall_follower_distance_band:
                 # Too close to wall - turn right (away from wall)
                 action = -3
-            elif wall_sensor > self.target_distance + 30:
+            elif wall_sensor > self.target_distance + config.wall_follower_distance_band:
                 # Too far from wall - turn left (toward wall)
-                if wall_sensor > 130:
+                if wall_sensor > config.wall_follower_far_threshold:
                     action = 3  # Turn more sharply toward wall
                 else:
                     action = 2  # Gentle turn toward wall
             else:
                 # In good range - prefer straight with slight bias
                 # Only adjust if significantly off-center
-                if wall_sensor < self.target_distance - 15:
+                if wall_sensor < self.target_distance - config.wall_follower_distance_fine_adjust:
                     action = -1  # Slight right
-                elif wall_sensor > self.target_distance + 15:
+                elif wall_sensor > self.target_distance + config.wall_follower_distance_fine_adjust:
                     action = 1  # Slight left
                 else:
                     action = 0  # Go straight - reduces oscillation
@@ -196,10 +202,13 @@ class WallFollower:
                 self.preferred_side = np.random.choice(['left', 'right'])
         else:
             # Already active - increment counter and check deactivation
+            from .navigation_config import NavigationConfig
+            config = NavigationConfig()
+
             self.steps_following += 1
 
-            # Check for open space (lowered threshold to 100px for earlier deactivation)
-            all_sensors_clear = np.all(np.array(sensor_readings) > 100)
+            # Check for open space
+            all_sensors_clear = np.all(np.array(sensor_readings) > config.wall_follower_deactivate_threshold)
             if all_sensors_clear:
                 self.active = False
                 self.preferred_side = None
