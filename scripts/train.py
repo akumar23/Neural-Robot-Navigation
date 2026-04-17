@@ -26,10 +26,21 @@ def calculate_collision_rate(data_loaders):
 
 
 def train_model(no_epochs):
+    if torch.cuda.is_available():
+        device = torch.device('cuda')
+    elif torch.backends.mps.is_available():
+        device = torch.device('mps')
+    else:
+        device = torch.device('cpu')
+    print(f"Device: {device}")
+    if device.type == 'cuda':
+        print(f"GPU: {torch.cuda.get_device_name(0)}")
+
     batch_size = 32
     data_loaders = Data_Loaders(batch_size)
     # Update model to use 20D input features (5 sensors + 6 spatial + 2 goal + 4 temporal + 2 spatial-goal + 1 action)
     model = Action_Conditioned_FF(input_size=20)
+    model = model.to(device)
 
     # Calculate collision rate for Focal Loss alpha parameter
     collision_rate = calculate_collision_rate(data_loaders)
@@ -57,7 +68,7 @@ def train_model(no_epochs):
 
     # Evaluate initial model
     model.eval()
-    initial_loss = model.evaluate(model, data_loaders.test_loader, loss_function)
+    initial_loss = model.evaluate(model, data_loaders.test_loader, loss_function, device)
     losses.append(initial_loss)
     print(f"Initial test loss: {initial_loss:.4f}")
 
@@ -71,9 +82,11 @@ def train_model(no_epochs):
 
         # Use train_loader for training (not test_loader!)
         for idx, sample in enumerate(data_loaders.train_loader):
+            inputs = sample['input'].to(device)
+            labels = sample['label'].to(device)
             optimizer.zero_grad()
-            output = model(sample['input'])
-            loss = loss_function(output, sample['label'])
+            output = model(inputs)
+            loss = loss_function(output, labels)
             loss.backward()
             optimizer.step()
             epoch_loss += loss.item()
@@ -83,7 +96,7 @@ def train_model(no_epochs):
 
         # Evaluate on test set
         model.eval()
-        test_loss = model.evaluate(model, data_loaders.test_loader, loss_function)
+        test_loss = model.evaluate(model, data_loaders.test_loader, loss_function, device)
         losses.append(test_loss)
 
         # Step the scheduler based on validation loss
@@ -95,7 +108,7 @@ def train_model(no_epochs):
             best_epoch = epoch_i + 1
             # Save best model
             models_path = Path(__file__).parent.parent / "models" / "saved_model.pkl"
-            torch.serialization.save(model.state_dict(), models_path)
+            torch.save(model.state_dict(), models_path)
 
         # Get current learning rate
         current_lr = optimizer.param_groups[0]['lr']

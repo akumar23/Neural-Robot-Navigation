@@ -1,468 +1,385 @@
-# Neural Network-Based Robot Navigation System
+# Collision-Detection Neural Net
 
-A sophisticated autonomous navigation system that uses neural networks to predict collision probabilities, enabling safe and efficient robot movement in complex 2D environments with obstacles.
+A PyTorch-based action-conditioned collision-probability predictor for a 2D autonomous-navigation robot. A residual feedforward network scores each discrete steering action for collision risk from raycast-derived features; the controller filters unsafe actions and selects among the remainder using a goal-directed steering behavior, with several recovery subsystems to handle stuck states.
 
-![Python](https://img.shields.io/badge/python-3.8+-blue.svg)
-![PyTorch](https://img.shields.io/badge/PyTorch-2.0+-ee4c2c.svg)
-![License](https://img.shields.io/badge/license-MIT-green.svg)
+Physics is handled by PyMunk; rendering (optional) by PyGame. Training data is self-collected from a `Wander` exploration policy; the network is trained with focal loss to handle the ~10% collision class imbalance. Monte Carlo Dropout is used at inference to estimate epistemic uncertainty and bias the controller toward conservative actions when the model is unsure.
 
-## What Does This Project Do?
+---
 
-Imagine teaching a robot to navigate a maze without crashing into walls. Instead of programming explicit rules like "if wall is close, turn left," this project uses machine learning to let the robot learn from experience. The robot:
+## Contents
 
-1. **Senses** its environment using 5 directional distance sensors (like a bat's echolocation)
-2. **Thinks** by feeding sensor data through a neural network that predicts "how risky is this action?"
-3. **Acts** by choosing the safest steering action that gets it closer to its goal
-4. **Learns** from 100,000+ examples of successful and failed navigation attempts
+1. [Overview](#overview)
+2. [System Architecture](#system-architecture)
+3. [Sensor Model and Feature Engineering](#sensor-model-and-feature-engineering)
+4. [Neural Network](#neural-network)
+5. [Action Selection and Control Loop](#action-selection-and-control-loop)
+6. [Reliability Subsystems](#reliability-subsystems)
+7. [Data Collection and Training](#data-collection-and-training)
+8. [Simulation Environment](#simulation-environment)
+9. [Installation and Usage](#installation-and-usage)
+10. [Testing and Evaluation](#testing-and-evaluation)
+11. [Repository Layout](#repository-layout)
+12. [Performance Characteristics](#performance-characteristics)
 
-The result? A robot that can navigate complex environments with 85-90% success rate, gracefully avoiding obstacles while making steady progress toward goals.
+---
 
-## Table of Contents
+## Overview
 
-- [How It Works: The Core Concept](#how-it-works-the-core-concept)
-- [The 20D Feedforward Model Explained](#the-20d-feedforward-model-explained)
-- [Why This Architecture?](#why-this-architecture)
-- [Quick Start](#quick-start)
-- [Installation](#installation)
-- [Usage](#usage)
-- [Technical Deep Dive](#technical-deep-dive)
-- [Performance & Results](#performance--results)
-- [Project Structure](#project-structure)
-- [Contributing](#contributing)
+The robot has:
 
-## How It Works: The Core Concept
+- 5 distance sensors via raycasting at angles `[+66°, +33°, 0°, −33°, −66°]`, range 150 px.
+- A discrete action space `A = {−5, −4, …, +4, +5}` (11 steering actions).
+- A feature pipeline that maps raw sensors plus robot/goal state to a 20-D vector.
+- A residual feedforward network `f_θ: R^20 → R` producing a collision logit per `(state, action)` pair.
+- A controller that, each decision cycle, evaluates `f_θ` for all 11 actions, discards those with `σ(f_θ) > τ`, and picks the remaining action closest to the heading demanded by a `Seek` steering behavior.
 
-### The Navigation Pipeline
+The network is trained offline on 100k `(features, collision)` pairs collected by a `Wander` policy. The threshold `τ` and several auxiliary subsystems (spatial memory, wall follower, waypoint planner, action smoother) handle cases where the learned policy alone fails (corners, oscillation, dead-ends).
 
-```
-┌─────────────┐      ┌──────────────┐      ┌─────────────┐      ┌──────────────┐
-│   Sensors   │ ───> │   Feature    │ ───> │  Neural     │ ───> │    Action    │
-│  (5 rays)   │      │ Engineering  │      │  Network    │      │  Selection   │
-│             │      │  (20 dims)   │      │ (20D FF)    │      │ (steering)   │
-└─────────────┘      └──────────────┘      └─────────────┘      └──────────────┘
-     ▲                                            │                     │
-     │                                            ▼                     │
-     │                                   ┌──────────────┐              │
-     │                                   │  Collision   │              │
-     │                                   │ Probability  │              │
-     └───────────────────────────────────┤    0 - 1     │◄─────────────┘
-                                         └──────────────┘
-```
+---
 
-**Step 1: Environmental Sensing**
-- The robot casts 5 distance sensors at angles: -66°, -33°, 0° (front), +33°, +66°
-- Each sensor returns the distance to the nearest obstacle (up to 150 pixels)
-- Think of it like stretching your arms out in different directions to feel for walls
-
-**Step 2: Feature Engineering**
-- Raw sensor readings are transformed into 20 meaningful features
-- These include spatial patterns, goal information, and movement history
-- Like how your brain doesn't just process raw light from your eyes, but extracts "edges," "colors," and "motion"
-
-**Step 3: Neural Network Prediction**
-- For each possible steering action (-5° to +5°), the network predicts collision probability
-- The network has learned from 100,000 examples what sensor patterns lead to crashes
-- Output: "If I turn left 3 degrees, there's a 15% chance I'll hit something"
-
-**Step 4: Safe Action Selection**
-- Filter out dangerous actions (collision probability > threshold)
-- Among safe actions, choose the one that points most toward the goal
-- Apply smoothing to avoid jerky movements
-
-### Why Neural Networks?
-
-Traditional rule-based approaches struggle because:
-- **Complexity**: "If sensor[0] < 50 AND sensor[2] > 100 AND turning left AND..." becomes unmaintainable
-- **Edge Cases**: Every environment configuration requires new rules
-- **Brittleness**: Small changes break carefully tuned thresholds
-
-Neural networks excel because:
-- **Pattern Recognition**: Learns complex, non-linear relationships from data
-- **Generalization**: Works in environments it has never seen before
-- **Adaptability**: Retrain with new data to improve performance
-
-## The 20D Feedforward Model Explained
-
-### What is a Feedforward Neural Network?
-
-A feedforward network is like a decision-making pipeline where information flows in one direction:
+## System Architecture
 
 ```
-Input (20 features)
-    ↓
-Hidden Layer 1 (64 neurons) ─┐
-    ↓                         │ Skip Connection
-Hidden Layer 2 (64 neurons) ←┘ (ResNet-style)
-    ↓
-Hidden Layer 3 (64 neurons)
-    ↓
-Output (collision probability)
+ raycast sensors (5)                                goal / robot / velocity
+         │                                                   │
+         ▼                                                   ▼
+ ┌───────────────────────────────────────────────────────────────┐
+ │ feature_engineering.engineer_features(...)                    │
+ │   → 20-D vector per candidate action a ∈ A                    │
+ └───────────────────────────────────────────────────────────────┘
+         │
+         ▼
+ ┌───────────────────────────┐
+ │ StandardScaler (20-D)      │   fit once at training time,
+ │ models/scaler.pkl          │   pickled for inference
+ └───────────────────────────┘
+         │
+         ▼
+ ┌───────────────────────────┐
+ │ Action_Conditioned_FF      │   residual FF, 3 res blocks,
+ │ input=20, hidden=64        │   LayerNorm, Dropout(0.2)
+ │ output: collision logit    │   FocalLoss during training
+ └───────────────────────────┘
+         │                       (optionally: MC Dropout,
+         ▼                        n_samples=10, adjusted
+ σ(logit) → p_collision(a)       prediction = μ + λσ)
+         │
+         ▼
+ ┌───────────────────────────┐    ┌──────────────────────────┐
+ │ safe-action filter         │◄───│ adaptive threshold τ     │
+ │   p(a) < τ                 │    └──────────────────────────┘
+ └───────────────────────────┘
+         │
+         ▼
+ ┌───────────────────────────┐    ┌──────────────────────────┐
+ │ Seek steering → desired a  │    │ recovery: spatial memory │
+ │ pick argmin |desired − a|  │◄───│ wall follower, waypoint  │
+ │ among safe actions         │    │ planner, action smoother │
+ └───────────────────────────┘    └──────────────────────────┘
+         │
+         ▼
+ PyMunk step × 20 physics substeps per decision
 ```
 
-**No loops, no memory between predictions** - each prediction is independent. This makes it:
-- **Fast**: Direct computation, no recurrent state to manage
-- **Simple**: Easier to debug and understand
-- **Effective**: Sufficient when features capture temporal patterns
+One decision cycle = 11 forward passes (one per candidate action) + steering + 20 physics substeps.
 
-### What Does "20D" Mean?
+---
 
-The network takes 20 carefully engineered features (20 dimensions) as input. Think of it like giving the robot 20 different "senses" about its world:
+## Sensor Model and Feature Engineering
 
-#### 1. Raw Sensor Readings (5 features)
-**What they are:** Distance measurements from 5 directional sensors
+### Raw Sensors
+
+Five raycast distances, each clamped to `[0, 150]` pixels:
+
+| Index | Angle   | Name                |
+|-------|---------|---------------------|
+| 0     | +66°    | `sensor_left_far`   |
+| 1     | +33°    | `sensor_left_near`  |
+| 2     |   0°    | `sensor_front`      |
+| 3     | −33°    | `sensor_right_near` |
+| 4     | −66°    | `sensor_right_far`  |
+
+### Feature Vector (20-D Enhanced)
+
+Current production pipeline uses the 20-D vector defined in `src/robot_navigation/feature_engineering.py::engineer_features`. A 12-D legacy mode is retained for backward compatibility and auto-selected when the optional arguments are omitted.
+
+| Idx   | Feature                 | Definition                                                                    | Range       |
+|-------|-------------------------|-------------------------------------------------------------------------------|-------------|
+| 0–4   | raw sensors             | 5 raycast distances (see above)                                               | `[0, 150]`  |
+| 5     | `min_sensor`            | `min(s)`                                                                      | `[0, 150]`  |
+| 6     | `sensor_variance`       | `std(s)`                                                                      | `[0, ∞)`    |
+| 7     | `front_to_side_ratio`   | `s[2] / ((s[0] + s[4])/2 + ε)`                                                | `[0, ∞)`    |
+| 8     | `left_right_asymmetry`  | `mean(s[0:2]) − mean(s[3:5])`                                                 | `(−∞, ∞)`   |
+| 9     | `front_clearance`       | `1 / (s[2] + ε)`                                                              | `(0, ∞)`    |
+| 10    | `side_gradient`         | `mean(abs(diff(s)))`                                                          | `[0, ∞)`    |
+| 11    | `goal_direction`        | `wrap(atan2(dy, dx) − θ_robot) / π`                                           | `[−1, 1]`   |
+| 12    | `goal_distance`         | `‖goal − robot‖ / 150`                                                        | `[0, ∞)`    |
+| 13    | `velocity_x`            | `v_x / 10`                                                                    | `[−1, 1]`   |
+| 14    | `velocity_y`            | `v_y / 10`                                                                    | `[−1, 1]`   |
+| 15    | `action_momentum`       | `mean(history[-5:]) / 5`                                                      | `[−1, 1]`   |
+| 16    | `action_variance`       | `std(history[-5:]) / 5`                                                       | `[0, 1]`    |
+| 17    | `front_goal_alignment`  | `(1 − ‖goal_direction‖) · (s[2] / 150)`                                       | `[0, 1]`    |
+| 18    | `escape_urgency`        | `1 / (min(s) + ε)`                                                            | `(0, ∞)`    |
+| 19    | `action`                | candidate steering action                                                     | `[−5, +5]`  |
+
+`ε = 1e−6`. `action_history` is a `deque(maxlen=5)`; when length is 0, momentum and variance default to 0. `wrap(·)` normalises to `[−π, π]` via `atan2(sin, cos)`.
+
+### Normalization
+
+A `sklearn.preprocessing.StandardScaler` is fit once at training time on the full 20-D feature matrix (collision label excluded) and persisted to `models/scaler.pkl`. At inference, `scaler.transform(feature_vec.reshape(1, -1))` is applied before the network forward pass. Do not include the collision label when transforming at inference — the scaler was not fit on it.
+
+---
+
+## Neural Network
+
+### Architecture: `Action_Conditioned_FF`
+
+Defined in `src/robot_navigation/networks.py`. Residual feedforward with `LayerNorm` (chosen over `BatchNorm` to support single-sample inference).
+
 ```
-        66°    33°    0°    -33°   -66°
-         ↖      ↑     ↑      ↑      ↗
-           \    |     |     |    /
-            \   |     |     |   /
-             ┌──┴─────┴─────┴──┐
-             │      ROBOT      │
-             └─────────────────┘
+x ∈ R^20
+  ↓
+Linear(20 → 64) → LayerNorm → ReLU → Dropout(0.2)
+  ↓
+[ ResidualBlock(64) ] × 3
+  ↓
+Linear(64 → 32) → LayerNorm → ReLU → Dropout(0.2)
+  ↓
+Linear(32 → 1)   ← logit (no sigmoid)
 ```
-**Real-world analogy:** Like having five people standing around you telling you how far away the nearest wall is in different directions.
 
-#### 2. Spatial Derived Features (6 features)
-**What they are:** Patterns extracted from raw sensors
+Each `ResidualBlock` is:
 
-| Feature | Description | Analogy |
-|---------|-------------|---------|
-| `min_sensor` | Closest obstacle distance | "The nearest wall is THIS close" |
-| `sensor_variance` | How varied readings are | "Am I in a narrow corridor or open space?" |
-| `front_to_side_ratio` | Front clearance vs. sides | "Is it more open ahead or to the sides?" |
-| `left_right_asymmetry` | Balance between sides | "Am I near a wall on one side?" |
-| `front_clearance` | How open ahead | "Can I go straight?" |
-| `side_gradient` | Rate of change across sensors | "Am I approaching a corner?" |
+```
+identity = x
+x = Linear(64→64) → LayerNorm → ReLU → Dropout(0.2)
+x = Linear(64→64) → LayerNorm
+x = ReLU(x + identity)
+```
 
-**Real-world analogy:** Not just knowing individual distances, but understanding the shape of the space around you - narrow hallway vs. open room.
+The forward method accepts both `(features,)` and `(batch, features)` tensors; single samples are unsqueezed internally and squeezed out before return.
 
-#### 3. Goal-Relative Features (2 features)
-**What they are:** Information about where the goal is
+### Output Handling
 
-| Feature | Description | Range |
-|---------|-------------|-------|
-| `goal_direction` | Normalized angle to goal | -1 (left) to +1 (right) |
-| `goal_distance` | Normalized distance to goal | 0 (far) to 1 (close) |
+- The network emits a **logit**. Apply `torch.sigmoid` to obtain `p_collision ∈ [0, 1]`.
+- NaN/Inf predictions are clamped to `1.0` (treated as unsafe) by the controller.
+- `FocalLoss` internally handles the sigmoid via BCE-with-logits semantics, so no sigmoid is baked into the model.
 
-**Real-world analogy:** Like having a compass that always points to your destination and tells you how far away it is.
-
-#### 4. Temporal Features (4 features)
-**What they are:** Information about movement and recent behavior
-
-| Feature | Description | Purpose |
-|---------|-------------|---------|
-| `velocity_x`, `velocity_y` | Current movement direction | "Which way am I moving right now?" |
-| `action_momentum` | Average of recent actions | "Have I been turning left consistently?" |
-| `action_variance` | Variability in recent actions | "Am I oscillating back and forth?" |
-
-**Real-world analogy:** Like remembering whether you've been walking straight or zigzagging - helps prevent going in circles.
-
-#### 5. Spatial-Goal Features (2 features)
-**What they are:** Relationships between obstacles and goal
-
-| Feature | Description | Insight |
-|---------|-------------|---------|
-| `front_goal_alignment` | Front sensor aligned with goal | "Is the goal straight ahead or blocked?" |
-| `escape_urgency` | Urgency based on closest obstacle | "How desperate is the situation?" |
-
-**Real-world analogy:** Knowing if you can walk straight toward your destination or if you need to navigate around obstacles.
-
-#### 6. Action (1 feature)
-**What it is:** The steering action being evaluated (-5 to +5 degrees)
-
-**The clever part:** The network evaluates all 11 possible actions and predicts collision probability for each. It's like asking "What if I turn left? What if I go straight? What if I turn right?" and getting a safety score for each option.
-
-### Network Architecture: ResNet-Style Design
+### Loss: Focal Loss
 
 ```python
-Input (20 features)
-    ↓
-[Linear Layer] → [LayerNorm] → [ReLU] → [Dropout]  (64 units)
-    ↓
-┌─────────────────────────────┐
-│  Residual Block 1           │
-│  [Linear] → [Norm] → [ReLU] │
-│       ↓                      │
-│  [Linear] → [Norm]          │
-│       ↓         ↑            │
-│       └────[+]──┘ Skip!      │
-└─────────────────────────────┘
-    ↓
-[Residual Block 2] (same structure)
-    ↓
-[Residual Block 3] (same structure)
-    ↓
-[Linear] → [Sigmoid] → Collision Probability (0-1)
+FL(p_t) = −α_t · (1 − p_t)^γ · log(p_t)
 ```
 
-**Key architectural choices:**
+with `α = max(0.1, collision_rate)` (≈ 0.10 on typical collected datasets) and `γ = 2.0`. The implementation computes `p_t` from logits with clamping to `[1e−7, 1 − 1e−7]` for numerical stability. This down-weights easy negatives and concentrates gradient on the ~10% collision minority class.
 
-- **Residual Blocks (Skip Connections)**: Allow gradients to flow backward more easily during training, enabling deeper networks without vanishing gradients
-- **LayerNorm**: Stabilizes training by normalizing activations
-- **Dropout (0.2)**: Prevents overfitting by randomly dropping connections during training
-- **FocalLoss**: Addresses class imbalance (collisions are rare ~3-10% of data)
+### Training Configuration
 
-**Monte Carlo Dropout**: During inference, we can run the network multiple times with dropout enabled to get uncertainty estimates. If predictions vary wildly, the network is "unsure" about that situation.
+| Hyperparameter   | Value                                                       |
+|------------------|-------------------------------------------------------------|
+| Optimizer        | Adam                                                        |
+| Initial LR       | `1e−2`                                                      |
+| LR Scheduler     | `ReduceLROnPlateau(mode=min, factor=0.5, patience=10, min_lr=1e-6)` |
+| Batch size       | 32                                                          |
+| Epochs           | 100                                                         |
+| Loss             | `FocalLoss(α=collision_rate, γ=2.0)`                        |
+| Device           | CUDA → MPS → CPU (auto-detected)                            |
+| Checkpointing    | Best by test loss → `models/saved_model.pkl`                |
 
-## Why This Architecture?
+### Monte Carlo Dropout (Inference-Time Uncertainty)
 
-We evaluated three different approaches to find the best balance of performance, simplicity, and maintainability.
+`scripts/run.py::predict_with_uncertainty` toggles the model into `train()` mode (dropout active) under `torch.no_grad()` and runs `n_samples=10` forward passes per action:
 
-### Models Tested
-
-#### 1. 12D Feedforward (Baseline)
-**Features:** Basic sensor readings + spatial derived features + action
 ```
-[5 sensors] + [6 spatial] + [1 action] = 12 dimensions
-```
-
-**Results:**
-- Test Loss: 0.0044
-- Success Rate: ~75-80%
-- Pros: Simple, fast
-- Cons: No goal awareness, limited context
-
-**Limitations:** The robot could avoid collisions but struggled with goal-seeking behavior. It would sometimes move away from the goal to avoid obstacles and never recover.
-
-#### 2. 20D LSTM (Temporal Memory)
-**Architecture:** Recurrent network with hidden state
-```
-Input (20 features) → LSTM Layer → Hidden State → Output
-                         ↑              │
-                         └──────────────┘ (remembers past)
+μ(a) = mean_i σ(f_θ(x_a))
+σ̂(a) = std_i  σ(f_θ(x_a))
+p_adj(a) = clip(μ(a) + λ · σ̂(a), 0, 1)        λ = uncertainty_penalty_factor
 ```
 
-**Results:**
-- Test Loss: 0.0013
-- Success Rate: ~80-85%
-- Pros: True temporal memory, captures long-term dependencies
-- Cons: More complex, harder to debug, slower inference
+`p_adj(a)` replaces the single-pass probability in the safe-action filter. Higher `σ̂` on out-of-distribution states pushes the action over the threshold and makes the controller conservative. Default `λ = 1.0`, `n_samples = 10`.
 
-**Limitations:** While powerful, the added complexity wasn't justified. The hidden state management made debugging difficult, and the performance gain was marginal.
+### LSTM Variant: `Action_Conditioned_LSTM`
 
-#### 3. 20D Feedforward (CHOSEN)
-**Features:** All 20 engineered features including goal-relative and temporal
+`networks.py` also defines a 2-layer LSTM (`hidden=64`, `dropout=0.2`, `batch_first=True`) with the same output head. It accepts `(batch, seq_len, 20)` during training and `(features,)` or `(batch, 1, 20)` at single-timestep inference. A learned hidden state lets the model capture temporal context directly rather than through engineered momentum/variance features. The main `run.py`/`train.py` paths use the feedforward model; the LSTM is available for sequence-level training workflows but is not wired into the production controller.
+
+---
+
+## Action Selection and Control Loop
+
+Per decision cycle (`scripts/run.py::goal_seeking`):
+
+1. Read robot and goal state; compute distance-to-goal progress signal.
+2. For each `a ∈ {−5,…,+5}`:
+   - Build 20-D features; `scaler.transform`; compute `p_adj(a)` via MC Dropout (or single-pass `σ(logit)` if `use_uncertainty=False`).
+   - Accept as safe if `p_adj(a) < τ`.
+3. `Seek.get_action(...)` returns the integer action closest to the goal-heading vector.
+4. Choose `argmin_{a ∈ safe} |desired − a|`.
+5. Apply the chosen action for 20 PyMunk substeps (`simulation_action_repeat = 20`).
+6. Update `action_history`, collision counters, stuck counter, and adaptive threshold.
+
+### Adaptive Collision Threshold
+
+Defined in `src/robot_navigation/navigation_config.py` (`NavigationConfig`). Default values:
+
+| Event                                                | τ update                                                                 |
+|------------------------------------------------------|--------------------------------------------------------------------------|
+| Initial                                              | `τ = 0.3` (`collision_threshold_initial`)                                |
+| Progress made (distance − last ≥ 5 px)               | gradually decay toward `0.3` (`collision_threshold_decrease_step`)        |
+| No progress for 30 cycles                            | `τ ← min(0.8, τ + 0.15)`                                                 |
+| Collision occurred                                   | `τ ← min(0.6, τ + increase_after_collision)`                             |
+| `consecutive_no_actions > 3`                         | `τ ← min(0.85, τ + increase_step)` (`collision_threshold_max = 0.85`)    |
+| Forced turn-around                                   | `τ = 0.5` (`collision_threshold_after_turn`)                             |
+| Goal reached                                         | `τ = 0.3` (reset)                                                        |
+
+The effect is: conservative when progressing, permissive when stuck, reset on goal.
+
+### Stuck Detection
+
+| Trigger                                                        | Action                                       |
+|----------------------------------------------------------------|----------------------------------------------|
+| `‖Δpos‖ < 3` px over `stuck_counter_max = 8` cycles            | `turn_robot_around()`; reset trackers        |
+| No safe actions for `no_safe_actions_turn_threshold = 15`      | `turn_robot_around()`; `τ ← 0.5`             |
+| Spatial-memory oscillation (`avg pairwise dist < 30` px, N=15) | force strong turn (`a ∈ {−5,−4,4,5}`)        |
+| Action-smoother thrashing (≥3 sign changes in history)         | override with random strong action           |
+
+---
+
+## Reliability Subsystems
+
+These modules augment the learned policy to guarantee liveness in degenerate states.
+
+**`action_smoother.ActionSmoother`** — Maintains an action deque of length 5 and blends `desired_action` with a momentum term weighted `momentum_weight = 0.4`. Detects *thrashing* (rapid sign alternation) and forces a random strong action to break the oscillation.
+
+**`spatial_memory.SpatialMemory`** — Discretises position into `grid_size = 30` px cells with a `decay_rate = 0.97` visit count and a `maxlen = 100` position deque. Exposes repulsion scores per candidate action (proportional to visit count of the predicted next cell) and an `oscillation_detected` flag based on average pairwise distance in the recent position buffer.
+
+**`wall_follower.WallFollower`** — Engaged when `stuck_counter > threshold` or multiple sensors read below the tight-space cutoff. Selects a preferred side (`left`/`right`) from sensor asymmetry, emits turn commands that maintain `target_distance = 70` px from the wall, deactivates after `max_follow_steps = 50` or when open space is detected.
+
+**`waypoint_planner.WaypointPlanner`** — When the direct path to the goal is blocked (front sensors occupied and goal-heading action unsafe), projects a waypoint `waypoint_distance = 120` px along the most-open direction, clamped to the bounded screen area with `boundary_margin = 50`. The waypoint replaces the goal for the `Seek` behavior until reached (`waypoint_reached_threshold = 50` px).
+
+**`openness_scorer.OpennessScorer`** — Per-action scalar score that weights the 5 raw sensor readings by an action-dependent kernel (e.g. strong left turn up-weights the +66° and +33° sensors). Used as a tie-breaker between safe actions with similar goal alignment.
+
+---
+
+## Data Collection and Training
+
+### Collection (`scripts/collect_data.py`)
+
+```python
+sim_env = SimulationEnvironment()
+wander  = Wander(action_repeat=100)
+for i in range(100_000):
+    action, force = wander.get_action(i, robot.angle)
+    for t in range(100):
+        _, collision, sensors = sim_env.step(force)  # sensors read on t == 0
+        if collision: break
+    features = engineer_features(
+        sensors, action,
+        robot_pos=robot.position, robot_angle=robot.angle,
+        goal_pos=goal.position, velocity=robot.velocity,
+        action_history=action_history,
+    )
+    action_history.append(action)
+    row = np.append(features, collision)    # 21 cols
+    ...
+np.savetxt("data/training_data.csv", rows, delimiter=",")
 ```
-[5 sensors] + [6 spatial] + [2 goal] + [4 temporal] + [2 spatial-goal] + [1 action] = 20 dimensions
+
+Each decision runs up to 100 physics substeps; on collision, the trajectory for that action is truncated and — if the collision fires in the first 30% of the substep budget — the label is back-propagated to the *previous* action row (the action that caused the terminal state). Output shape `(100000, 21)`. Typical collision rate ≈ 10%.
+
+### Training (`scripts/train.py`)
+
+```
+device = cuda | mps | cpu
+data   = Data_Loaders(batch_size=32)     # train / test split via data_loaders.py
+model  = Action_Conditioned_FF(input_size=20)
+α_FL   = max(0.1, collision_rate(data.train_loader))
+loss   = FocalLoss(alpha=α_FL, gamma=2.0)
+opt    = Adam(model.parameters(), lr=1e-2)
+sched  = ReduceLROnPlateau(opt, factor=0.5, patience=10, min_lr=1e-6)
+for epoch in range(100):
+    for batch in data.train_loader:
+        loss(model(batch["input"]), batch["label"]).backward(); opt.step()
+    test_loss = model.evaluate(...)
+    sched.step(test_loss)
+    if test_loss < best: save(model.state_dict(), "models/saved_model.pkl")
 ```
 
-**Results:**
-- Test Loss: 0.0010 (77% improvement over baseline!)
-- Success Rate: ~85-90%
-- Pros: Best performance, simple architecture, fast, maintainable
-- Cons: Requires good feature engineering
+The `StandardScaler` is fit inside `data_loaders.Data_Loaders` on the 20-D feature matrix (collision label excluded at column 20) and pickled to `models/scaler.pkl`.
 
-### Performance Comparison
+---
 
-| Model | Test Loss | Success Rate | Inference Speed | Complexity | Maintainability |
-|-------|-----------|--------------|-----------------|------------|-----------------|
-| 12D FF | 0.0044 | 75-80% | ⚡⚡⚡ Fast | ⭐ Low | ⭐⭐⭐ Easy |
-| 20D LSTM | 0.0013 | 80-85% | ⚡ Moderate | ⭐⭐⭐ High | ⭐ Difficult |
-| **20D FF** | **0.0010** | **85-90%** | **⚡⚡ Fast** | **⭐⭐ Medium** | **⭐⭐ Moderate** |
+## Simulation Environment
 
-### Why 20D Feedforward Won
+Implemented in `src/robot_navigation/simulation.py`.
 
-**1. Best Performance**
-- Lowest test loss (0.0010) means most accurate collision predictions
-- Highest success rate in real navigation tasks
-- Better goal-seeking behavior than baseline
+- **Physics:** PyMunk (Chipmunk2D), Cartesian coordinates, y-up.
+- **Rendering:** PyGame, screen coordinates, y-down. Coordinate helpers in `helper.py`:
+  - `pm2pgP(point)` / `pg2pmP(point)` — position conversions.
+  - `pm2pgV(vec)` — vector (flips y).
+- **Robot:** Box-shaped `pm.Body` with `pm.Poly` collision shape, configurable via `NavigationConfig` (mass, speed, friction, turn-rate limits). 5 raycasting sensors attached at the documented angles.
+- **Obstacles / goal:** Randomly placed rectangles; goal is a `pm.Body` respawned on reach. Collisions detected via PyMunk shape filters (`categories = 0b1`).
+- **Decision cadence:** `action_repeat = 20` physics steps per controller decision (100 during data collection, to produce more diverse trajectory segments per action).
+- **Headless mode:** `simulation.py` sets `HEADLESS = True` and `os.environ['SDL_VIDEODRIVER'] = 'dummy'` at import time. Required for unattended training / test runs.
 
-**2. Simplicity Over Complexity**
-- No hidden state to manage (unlike LSTM)
-- Each prediction is independent - easier to debug
-- Clear input → output relationship
+---
 
-**3. Feature Engineering FTW**
-- The 20D features capture temporal patterns (action_momentum, action_variance) without needing recurrent architecture
-- This is a key insight: **good features can replace architectural complexity**
-- The network doesn't need to "remember" recent actions because we explicitly provide that information
-
-**4. Speed & Efficiency**
-- Faster inference than LSTM (important for real-time control)
-- Single forward pass vs. sequential processing
-
-**5. Maintainability**
-- Easier to understand what the network is learning
-- Simpler to add new features or modify architecture
-- Better for collaboration and future improvements
-
-### The Trade-off Philosophy
-
-> "Make things as simple as possible, but not simpler." - Albert Einstein
-
-We could have used a more complex model (Transformers, Graph Neural Networks, etc.), but:
-- The problem doesn't require that complexity
-- More complexity = more ways to fail
-- Development time is valuable
-- Explainability matters
-
-The 20D FF hits the sweet spot: sophisticated enough to solve the problem well, simple enough to understand and maintain.
-
-## Quick Start
-
-Get the robot navigating in under 5 minutes:
-
-```bash
-# 1. Clone the repository
-git clone <repository-url>
-cd Collision-Detection-Neural-Net
-
-# 2. Install dependencies
-pip install -r requirements.txt
-
-# 3. Run the pre-trained model
-python scripts/run.py
-```
-
-You should see a pygame window with a robot navigating toward goals while avoiding obstacles!
-
-## Installation
+## Installation and Usage
 
 ### Requirements
 
-- Python 3.8 or higher
-- PyTorch 2.0+
-- PyMunk (physics engine)
-- PyGame (visualization)
-- NumPy, Pandas, Scikit-learn
+Python ≥ 3.8. From `requirements.txt`:
 
-### Step-by-Step Installation
-
-1. **Create a virtual environment (recommended)**
-```bash
-python -m venv venv
-source venv/bin/activate  # On Windows: venv\Scripts\activate
+```
+pymunk
+numpy
+noise
+torch
+matplotlib
+scikit-learn
+pygame
 ```
 
-2. **Install dependencies**
+### Install
+
 ```bash
+python -m venv venv
+source venv/bin/activate      # Windows: venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
-3. **Verify installation**
+### Collect Data
+
 ```bash
-python -c "import torch; import pymunk; import pygame; print('All dependencies installed!')"
+python scripts/collect_data.py
+# → data/training_data.csv  (100_000 × 21)
 ```
 
-### Requirements File
+### Train
 
-```txt
-torch>=2.0.0
-pymunk>=6.0.0
-pygame>=2.0.0
-numpy>=1.20.0
-pandas>=1.3.0
-scikit-learn>=1.0.0
+```bash
+python scripts/train.py
+# → models/saved_model.pkl, models/scaler.pkl
 ```
 
-## Usage
+`train.py` auto-selects CUDA, Apple MPS, or CPU. Expect ~100 epochs; best-by-test-loss checkpointing.
 
-### Running the Simulation
+### Run (Trained Model)
 
-**Basic usage:**
 ```bash
 python scripts/run.py
 ```
 
-This runs the robot in a visualized environment using the pre-trained 20D feedforward model.
+By default runs `goal_seeking(goals_to_reach=2, use_uncertainty=True, uncertainty_penalty_factor=1.0, n_mc_samples=10)`. Toggle `use_uncertainty=False` for single-pass inference.
 
-**Headless mode (no visualization):**
-```python
-# In simulation.py or run.py, set:
-HEADLESS = True
-```
-
-### Collecting Training Data
-
-Generate new training data by running the robot with exploration behavior:
+### Test
 
 ```bash
-python scripts/collect_data.py
-```
-
-**What this does:**
-- Robot uses Wander behavior to randomly explore
-- Records sensor readings, features, actions, and collision labels
-- Generates `data/training_data.csv` with 100,000+ samples
-- Typical session: 10-20 minutes for 100k samples
-
-**Data format:**
-```csv
-sensor_0,sensor_1,sensor_2,sensor_3,sensor_4,...,action,collision
-120.5,95.3,150.0,88.2,110.7,...,2,0
-45.2,30.1,25.8,80.3,90.5,...,-3,1
-```
-
-### Training the Model
-
-Train a new model from scratch:
-
-```bash
-python scripts/train.py
-```
-
-**Training process:**
-1. Loads `data/training_data.csv`
-2. Engineers 20D features from raw data
-3. Fits StandardScaler on training data
-4. Trains 20D feedforward network with FocalLoss
-5. Saves best model to `models/saved_model.pkl`
-6. Saves scaler to `models/scaler.pkl`
-
-**Training parameters:**
-- Batch size: 64
-- Learning rate: 0.01 (with ReduceLROnPlateau scheduler)
-- Epochs: 100
-- Loss: FocalLoss (alpha=collision_rate, gamma=2.0)
-- Optimizer: Adam
-
-**Expected output:**
-```
-Epoch 1/100: Train Loss: 0.0245, Val Loss: 0.0198
-Epoch 10/100: Train Loss: 0.0089, Val Loss: 0.0075
-...
-Epoch 95/100: Train Loss: 0.0012, Val Loss: 0.0010
-Best model saved with validation loss: 0.0010
-```
-
-### Testing & Evaluation
-
-Run comprehensive movement tests:
-
-```bash
-# Basic test (5 tests, 1000 iterations each)
-python tests/test_robot_movement.py
-
-# Custom configuration
+python tests/test_robot_movement.py                              # default: 5 tests × 1000 iters
 python tests/test_robot_movement.py --tests 10 --iterations 2000
-
-# Quiet mode (minimal output)
 python tests/test_robot_movement.py --quiet
 ```
 
-**Test metrics:**
-- Success rate (goal reached)
-- Average iterations per goal
-- Collision frequency
-- Average progress toward goal
-- Stuck detection events
-
-**Example output:**
-```
-Test 1/5: Success! Reached goal in 842 iterations, 2 collisions
-Test 2/5: Success! Reached goal in 1105 iterations, 1 collision
-Test 3/5: Timeout. Progress: 78%, 0 collisions
-Test 4/5: Success! Reached goal in 923 iterations, 3 collisions
-Test 5/5: Success! Reached goal in 756 iterations, 1 collision
-
-=== Summary ===
-Success Rate: 80%
-Average Iterations: 906.5
-Average Collisions: 1.4
-```
-
 ### Unit Tests
-
-Test individual components:
 
 ```bash
 python tests/test_openness_scorer.py
@@ -471,603 +388,78 @@ python tests/test_wall_follower_unit.py
 python tests/test_waypoint_planner_unit.py
 ```
 
-## Technical Deep Dive
+---
 
-### System Architecture
+## Testing and Evaluation
 
-```
-┌─────────────────────────────────────────────────────────────┐
-│                     Simulation Loop                          │
-│  ┌──────────────────────────────────────────────────────┐  │
-│  │  PyMunk Physics Engine                               │  │
-│  │  - Collision detection                                │  │
-│  │  - Rigid body dynamics                                │  │
-│  │  - Raycasting sensors                                 │  │
-│  └──────────────────────────────────────────────────────┘  │
-└─────────────────────────────────────────────────────────────┘
-                           ↓
-┌─────────────────────────────────────────────────────────────┐
-│                 Feature Engineering Pipeline                 │
-│  Raw Sensors → Derived Features → Goal Features → Temporal  │
-│  (5 dims)      (6 dims)            (2 dims)       (4 dims)   │
-└─────────────────────────────────────────────────────────────┘
-                           ↓
-┌─────────────────────────────────────────────────────────────┐
-│              Neural Network (20D Feedforward)                │
-│  Input (20) → Hidden (64) → Residual Blocks → Output (1)    │
-│              ↓ Normalization, Dropout, Skip Connections      │
-└─────────────────────────────────────────────────────────────┘
-                           ↓
-┌─────────────────────────────────────────────────────────────┐
-│                   Action Selection Logic                     │
-│  ┌────────────┐  ┌──────────────┐  ┌──────────────┐        │
-│  │  Safety    │→ │   Steering   │→ │   Action     │        │
-│  │  Filtering │  │   Behavior   │  │   Smoothing  │        │
-│  └────────────┘  └──────────────┘  └──────────────┘        │
-└─────────────────────────────────────────────────────────────┘
-                           ↓
-┌─────────────────────────────────────────────────────────────┐
-│                  Recovery Mechanisms                         │
-│  - Adaptive Threshold  - Wall Following  - Spatial Memory   │
-│  - Waypoint Planning   - Stuck Detection                    │
-└─────────────────────────────────────────────────────────────┘
-```
+`tests/test_robot_movement.py` is the primary end-to-end harness. It instantiates the simulator, loads the trained model, and runs `N` independent trials (random obstacle/goal placement). Per-trial metrics:
 
-### Feature Engineering Pipeline
+| Metric                    | Definition                                                    |
+|---------------------------|---------------------------------------------------------------|
+| Success rate              | fraction of trials reaching the goal before iteration timeout |
+| Avg iterations to goal    | mean over successful trials                                   |
+| Collision count           | total collision events per trial                              |
+| Avg progress              | final distance-reduction / initial distance                   |
+| Stuck events              | count of triggered turn-around / wall-follower activations    |
 
-**Input:** Raw sensor readings (5 distances)
-**Output:** 20-dimensional feature vector
-
-```python
-def engineer_features(sensor_readings, goal_pos, robot_pos, robot_vel, action_history):
-    features = []
-
-    # 1. Raw sensors (5)
-    features.extend(sensor_readings)
-
-    # 2. Spatial derived (6)
-    features.append(min(sensor_readings))  # min_sensor
-    features.append(np.var(sensor_readings))  # sensor_variance
-    features.append(sensor_readings[2] / np.mean([sensor_readings[0], sensor_readings[4]]))  # front_to_side_ratio
-    features.append((np.mean(sensor_readings[:2]) - np.mean(sensor_readings[3:])))  # left_right_asymmetry
-    features.append(sensor_readings[2])  # front_clearance
-    features.append(np.gradient(sensor_readings).mean())  # side_gradient
-
-    # 3. Goal-relative (2)
-    goal_vector = goal_pos - robot_pos
-    goal_angle = np.arctan2(goal_vector[1], goal_vector[0])
-    features.append(normalize_angle(goal_angle))  # goal_direction
-    features.append(normalize_distance(np.linalg.norm(goal_vector)))  # goal_distance
-
-    # 4. Temporal (4)
-    features.extend([robot_vel[0], robot_vel[1]])  # velocity_x, velocity_y
-    features.append(np.mean(action_history))  # action_momentum
-    features.append(np.var(action_history))  # action_variance
-
-    # 5. Spatial-goal (2)
-    features.append(sensor_readings[2] * np.cos(goal_angle))  # front_goal_alignment
-    features.append(1.0 / (min(sensor_readings) + 1e-5))  # escape_urgency
-
-    return np.array(features)
-```
-
-### Neural Network Architecture
-
-**Implementation in PyTorch:**
-
-```python
-class Action_Conditioned_FF(nn.Module):
-    def __init__(self, input_size=20, hidden_size=64, output_size=1):
-        super().__init__()
-
-        # Initial projection
-        self.fc1 = nn.Linear(input_size, hidden_size)
-        self.ln1 = nn.LayerNorm(hidden_size)
-        self.dropout = nn.Dropout(0.2)
-
-        # Residual blocks
-        self.res_blocks = nn.ModuleList([
-            ResidualBlock(hidden_size) for _ in range(3)
-        ])
-
-        # Output layer
-        self.fc_out = nn.Linear(hidden_size, output_size)
-
-    def forward(self, x):
-        # Initial transformation
-        x = F.relu(self.ln1(self.fc1(x)))
-        x = self.dropout(x)
-
-        # Residual blocks
-        for block in self.res_blocks:
-            x = block(x)
-
-        # Output (logit)
-        x = self.fc_out(x)
-        return x  # Apply sigmoid later for probability
-
-class ResidualBlock(nn.Module):
-    def __init__(self, hidden_size):
-        super().__init__()
-        self.fc1 = nn.Linear(hidden_size, hidden_size)
-        self.ln1 = nn.LayerNorm(hidden_size)
-        self.fc2 = nn.Linear(hidden_size, hidden_size)
-        self.ln2 = nn.LayerNorm(hidden_size)
-        self.dropout = nn.Dropout(0.2)
-
-    def forward(self, x):
-        residual = x
-        out = F.relu(self.ln1(self.fc1(x)))
-        out = self.dropout(out)
-        out = self.ln2(self.fc2(out))
-        out += residual  # Skip connection
-        out = F.relu(out)
-        return out
-```
-
-### FocalLoss for Class Imbalance
-
-Collisions are rare events (3-10% of training data). Standard cross-entropy loss would bias the network toward predicting "no collision" all the time. FocalLoss addresses this:
-
-```python
-class FocalLoss(nn.Module):
-    def __init__(self, alpha=0.25, gamma=2.0):
-        super().__init__()
-        self.alpha = alpha  # Weight for positive class (collisions)
-        self.gamma = gamma  # Focusing parameter (down-weights easy examples)
-
-    def forward(self, inputs, targets):
-        BCE_loss = F.binary_cross_entropy_with_logits(inputs, targets, reduction='none')
-        pt = torch.exp(-BCE_loss)  # Probability of correct class
-        F_loss = self.alpha * (1-pt)**self.gamma * BCE_loss
-        return F_loss.mean()
-```
-
-**Key parameters:**
-- `alpha`: Set to collision rate (~0.03-0.10) to up-weight rare collision examples
-- `gamma`: Set to 2.0 to focus on hard examples (network is unsure)
-
-### Adaptive Collision Threshold
-
-The collision probability threshold dynamically adjusts based on robot behavior:
-
-```python
-threshold = 0.3  # Initial (conservative)
-
-# Increase if stuck (no progress)
-if iterations_without_progress > 8:
-    threshold = min(0.8, threshold + 0.15)
-
-# Increase after collision
-if collision_detected:
-    threshold = 0.6
-
-# Increase if no safe actions repeatedly
-if consecutive_no_safe_actions > 15:
-    threshold = min(0.8, threshold + 0.15)
-
-# Reset on goal reached
-if goal_reached:
-    threshold = 0.3
-```
-
-This allows the robot to take calculated risks when stuck while being cautious when making good progress.
-
-### Stuck Detection & Recovery
-
-**Multiple mechanisms prevent infinite loops:**
-
-1. **Position-based stuck detection:**
-```python
-if distance_moved < 3.0 and iterations > 8:
-    # Force turn-around
-    chosen_action = random.choice([-5, 5])
-    stuck_iterations = 0
-```
-
-2. **No safe actions handling:**
-```python
-if no_safe_actions_count > 15:
-    # Activate wall follower
-    wall_follower.activate()
-```
-
-3. **Spatial memory oscillation detection:**
-```python
-if spatial_memory.detect_oscillation():
-    # Force strong turn away from oscillation pattern
-    chosen_action = random.choice([-4, -5, 4, 5])
-```
-
-4. **Action smoother thrashing detection:**
-```python
-if action_smoother.detect_thrashing():
-    # Override with random strong action
-    chosen_action = random.choice([-5, -4, 4, 5])
-```
-
-### Wall Following Behavior
-
-When stuck, the robot systematically follows walls:
-
-```python
-class WallFollower:
-    def follow(self, sensors):
-        # Find closest wall
-        min_sensor_idx = np.argmin(sensors)
-
-        # Turn parallel to wall
-        if min_sensor_idx <= 1:  # Wall on left
-            return 3  # Turn right to follow
-        elif min_sensor_idx >= 3:  # Wall on right
-            return -3  # Turn left to follow
-        else:  # Wall ahead
-            return random.choice([-4, 4])  # Turn sharply
-```
-
-This ensures systematic exploration instead of random wandering when stuck.
-
-### Coordinate System Conversions
-
-PyMunk (physics) uses Cartesian coordinates (y-up), while PyGame (rendering) uses screen coordinates (y-down):
-
-```python
-def pm2pgP(point):
-    """PyMunk to PyGame position"""
-    return int(point[0]), int(600 - point[1])
-
-def pg2pmP(point):
-    """PyGame to PyMunk position"""
-    return point[0], 600 - point[1]
-
-def pm2pgV(vec):
-    """PyMunk to PyGame vector (flip y)"""
-    return vec[0], -vec[1]
-```
-
-## Performance & Results
-
-### Training Results
-
-**Dataset:**
-- 100,000 samples
-- Collision rate: 3.05%
-- Train/Val split: 80/20
-
-**Model comparison:**
-
-| Metric | 12D FF | 20D LSTM | 20D FF (Best) |
-|--------|--------|----------|---------------|
-| Train Loss | 0.0046 | 0.0014 | 0.0011 |
-| Test Loss | 0.0044 | 0.0013 | **0.0010** |
-| Training Time | 8 min | 15 min | 10 min |
-| Inference Time | 2ms | 8ms | 3ms |
-
-**Loss curves:**
-```
-Training Loss (20D FF)
-0.025 |*
-      | *
-0.020 |  *
-      |   *
-0.015 |    *
-      |      *
-0.010 |        ***
-      |           ****
-0.005 |               *****
-      |                    ********
-0.001 |________________________*********
-      0   10   20   30   40   50   60   70
-                    Epoch
-```
-
-### Navigation Results
-
-**Test conditions:**
-- 10 tests per configuration
-- 2000 iteration timeout
-- Random obstacle placement
-- Random goal positions
-
-| Metric | 12D FF | 20D FF |
-|--------|--------|--------|
-| Success Rate | 75% | **87%** |
-| Avg Iterations | 1050 | **856** |
-| Avg Collisions | 2.3 | **1.1** |
-| Avg Progress | 82% | **94%** |
-| Stuck Events | 4.2 | **1.8** |
-
-**Improvements:**
-- 12% higher success rate
-- 18.5% faster goal achievement
-- 52% fewer collisions
-- 14.6% better average progress
-
-### Real-World Performance Characteristics
-
-**What makes navigation difficult:**
-- U-shaped obstacles (requires backing out)
-- Narrow corridors (limited action space)
-- Multiple goals in sequence (no reset between)
-- Complex obstacle patterns (maze-like)
-
-**Where the model excels:**
-- Open environments with sparse obstacles
-- Clear paths with minor detours needed
-- Short to medium distances (< 500 pixels)
-
-**Where it struggles:**
-- Very narrow passages (< 2x robot radius)
-- Dead ends requiring precise backtracking
-- Highly cluttered environments (> 80% occupied)
-
-## Project Structure
-
-```
-Collision-Detection-Neural-Net/
-│
-├── src/robot_navigation/
-│   ├── simulation.py           # PyMunk physics, collision detection, sensors
-│   ├── networks.py             # Neural network architectures (20D FF, LSTM)
-│   ├── steering.py             # Seek (goal) and Wander (exploration) behaviors
-│   ├── feature_engineering.py  # 20D feature computation
-│   ├── action_smoother.py      # Reduces oscillation via momentum
-│   ├── spatial_memory.py       # Grid-based position tracking
-│   ├── wall_follower.py        # Systematic wall-following escape
-│   ├── openness_scorer.py      # Evaluates open space per action
-│   ├── waypoint_planner.py     # Intermediate navigation targets
-│   ├── data_loaders.py         # PyTorch DataLoader
-│   └── helper.py               # Vector/angle utilities
-│
-├── scripts/
-│   ├── run.py                  # Main simulation with trained model
-│   ├── train.py                # Model training script
-│   └── collect_data.py         # Training data collection
-│
-├── tests/
-│   ├── test_robot_movement.py         # Comprehensive navigation tests
-│   ├── test_openness_scorer.py        # Unit tests for openness scorer
-│   ├── test_spatial_memory.py         # Unit tests for spatial memory
-│   ├── test_wall_follower_unit.py     # Unit tests for wall follower
-│   └── test_waypoint_planner_unit.py  # Unit tests for waypoint planner
-│
-├── models/
-│   ├── saved_model.pkl         # Trained 20D FF network
-│   └── scaler.pkl              # StandardScaler for feature normalization
-│
-├── data/
-│   └── training_data.csv       # Collected training samples
-│
-├── assets/
-│   ├── robot.png
-│   ├── robot_inverse.png
-│   └── demo.gif
-│
-├── requirements.txt            # Python dependencies
-├── CLAUDE.md                   # Project instructions for Claude Code
-└── README.md                   # This file
-```
-
-### Key Files Explained
-
-**Core Navigation:**
-- `simulation.py`: Physics environment, sensors, collision detection
-- `networks.py`: Neural network definitions (20D FF is the main model)
-- `feature_engineering.py`: Transforms raw sensors into 20D features
-- `steering.py`: Behavioral controllers (Seek toward goal, Wander for exploration)
-
-**Action Selection:**
-- `run.py` or `test_robot_movement.py`: Main action selection loop
-  - Get sensor readings → engineer features → predict collision for each action → filter safe actions → choose action closest to desired direction → apply smoothing
-
-**Recovery Mechanisms:**
-- `action_smoother.py`: Prevents jerky movements, detects thrashing
-- `spatial_memory.py`: Remembers visited positions, detects loops
-- `wall_follower.py`: Systematic escape when stuck
-- `waypoint_planner.py`: Creates intermediate goals when blocked
-- `openness_scorer.py`: Helps choose actions toward open space
-
-**Data & Training:**
-- `collect_data.py`: Random exploration to gather training examples
-- `train.py`: Network training with FocalLoss and ReduceLROnPlateau
-
-## Advanced Topics
-
-### Monte Carlo Dropout for Uncertainty
-
-Enable uncertainty estimation during inference:
-
-```python
-def predict_with_uncertainty(model, features, n_samples=10):
-    model.train()  # Keep dropout active
-    predictions = []
-
-    for _ in range(n_samples):
-        with torch.no_grad():
-            logit = model(features)
-            prob = torch.sigmoid(logit)
-            predictions.append(prob.item())
-
-    mean_prob = np.mean(predictions)
-    uncertainty = np.std(predictions)
-
-    return mean_prob, uncertainty
-
-# Usage
-prob, uncertainty = predict_with_uncertainty(model, features)
-if uncertainty > 0.2:
-    # Model is unsure - be more conservative
-    threshold = 0.2
-```
-
-This helps identify situations where the model hasn't seen similar training examples.
-
-### Feature Importance Analysis
-
-Understand which features matter most:
-
-```python
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.inspection import permutation_importance
-
-# Train RF on same data
-rf = RandomForestClassifier(n_estimators=100)
-rf.fit(X_train, y_train)
-
-# Compute importances
-importances = rf.feature_importances_
-feature_names = ['sensor_0', 'sensor_1', ..., 'goal_direction', ...]
-
-for name, importance in zip(feature_names, importances):
-    print(f"{name}: {importance:.4f}")
-```
-
-**Typical importance ranking:**
-1. `min_sensor` (closest obstacle) - 18%
-2. `front_clearance` - 15%
-3. `goal_direction` - 12%
-4. `escape_urgency` - 10%
-5. Others - 45%
-
-### Hyperparameter Tuning
-
-**Key hyperparameters to tune:**
-
-| Parameter | Default | Range | Effect |
-|-----------|---------|-------|--------|
-| `hidden_size` | 64 | 32-128 | Larger = more capacity, slower |
-| `num_residual_blocks` | 3 | 2-5 | More blocks = deeper network |
-| `dropout` | 0.2 | 0.1-0.5 | Higher = less overfitting |
-| `learning_rate` | 0.01 | 0.001-0.1 | Lower = slower, more stable |
-| `focal_alpha` | collision_rate | 0.05-0.5 | Higher = more weight on collisions |
-| `focal_gamma` | 2.0 | 1.0-3.0 | Higher = focus on hard examples |
-| `collision_threshold` | 0.3 | 0.1-0.5 | Lower = more conservative |
-
-### Transfer Learning
-
-Train on simple environments, fine-tune on complex ones:
-
-```python
-# 1. Train on simple environment (sparse obstacles)
-model = train_model(simple_data)
-
-# 2. Freeze early layers
-for param in model.fc1.parameters():
-    param.requires_grad = False
-
-# 3. Fine-tune on complex environment
-model = train_model(complex_data, pretrained_model=model, epochs=20)
-```
-
-## Troubleshooting
-
-### Common Issues
-
-**Robot gets stuck in corners:**
-- Increase `escape_urgency` feature weight
-- Lower initial collision threshold (0.2 instead of 0.3)
-- Activate wall follower sooner (decrease no_safe_actions threshold)
-
-**Robot oscillates back and forth:**
-- Increase action smoothing momentum (higher alpha)
-- Check `action_variance` feature is computed correctly
-- Adjust thrashing detection sensitivity
-
-**Poor goal-seeking behavior:**
-- Verify `goal_direction` feature is normalized correctly
-- Check that goal-relative features are being used
-- Increase weight on goal alignment in action selection
-
-**Model predicts all zeros (no collisions):**
-- Check FocalLoss alpha parameter (should be ~ collision rate)
-- Verify class imbalance in training data
-- Increase focal gamma to focus on hard examples
-
-**Training loss not decreasing:**
-- Check feature normalization (StandardScaler fitted correctly)
-- Verify learning rate (try 0.001 or 0.0001)
-- Check for NaN values in features
-- Ensure collision labels are 0/1, not other values
-
-## Contributing
-
-Contributions are welcome! Areas for improvement:
-
-1. **Model Architecture:**
-   - Experiment with attention mechanisms
-   - Try different activation functions (GELU, Swish)
-   - Implement ensemble methods
-
-2. **Feature Engineering:**
-   - Add more temporal features (acceleration, jerk)
-   - Include obstacle shape features
-   - Experiment with learned features (autoencoders)
-
-3. **Recovery Behaviors:**
-   - Improve wall-following logic
-   - Implement A* path planning for waypoints
-   - Add reactive obstacle avoidance
-
-4. **Testing:**
-   - Create standardized benchmark environments
-   - Add visualization of decision boundaries
-   - Implement ablation studies
-
-### Development Setup
-
-```bash
-# Fork and clone
-git clone <your-fork-url>
-cd Collision-Detection-Neural-Net
-
-# Create feature branch
-git checkout -b feature/my-improvement
-
-# Make changes, test
-python tests/test_robot_movement.py
-
-# Commit and push
-git add .
-git commit -m "Add improvement: description"
-git push origin feature/my-improvement
-
-# Create pull request on GitHub
-```
-
-## License
-
-MIT License - see LICENSE file for details.
-
-## Acknowledgments
-
-- PyMunk for physics simulation
-- PyTorch for deep learning framework
-- Research on FocalLoss for class imbalance
-- ResNet architecture inspiration
-
-## Citation
-
-If you use this project in your research, please cite:
-
-```bibtex
-@software{neural_robot_navigation,
-  title = {Neural Network-Based Robot Navigation System},
-  author = {Your Name},
-  year = {2025},
-  url = {https://github.com/yourusername/Collision-Detection-Neural-Net}
-}
-```
-
-## Demo
-
-Demo video of the robot in action:
-
-![Demo](assets/demo.gif)
-
-## Contact
-
-Questions? Suggestions? Open an issue or reach out!
+Harness integrates the same recovery subsystems as `run.py`, including action-history propagation into `engineer_features` and MC Dropout uncertainty estimation.
 
 ---
 
-**Built with curiosity, debugged with patience, deployed with pride.**
+## Repository Layout
+
+```
+Collision-Detection-Neural-Net/
+├── src/robot_navigation/
+│   ├── simulation.py           # PyMunk world, robot, raycasting, collision detection
+│   ├── networks.py             # Action_Conditioned_FF, Action_Conditioned_LSTM, FocalLoss
+│   ├── feature_engineering.py  # 12-D legacy / 20-D enhanced feature pipeline
+│   ├── steering.py             # Seek (goal) and Wander (exploration) behaviors
+│   ├── action_smoother.py      # Momentum smoothing + thrashing detection
+│   ├── spatial_memory.py       # Grid visit counts, oscillation detection
+│   ├── wall_follower.py        # Wall-following escape controller
+│   ├── openness_scorer.py      # Per-action open-space scoring
+│   ├── waypoint_planner.py     # Intermediate-goal generation
+│   ├── navigation_config.py    # NavigationConfig dataclass (all tuning constants)
+│   ├── data_loaders.py         # Data_Loaders: splits, scaler fit, DataLoader wrapping
+│   └── helper.py               # Vector/angle utilities, coordinate conversions
+├── scripts/
+│   ├── collect_data.py         # Wander-based 100k sample collection
+│   ├── train.py                # Training loop, FocalLoss, ReduceLROnPlateau
+│   └── run.py                  # Inference loop with MC Dropout + recovery stack
+├── tests/
+│   ├── test_robot_movement.py  # End-to-end navigation harness
+│   ├── test_openness_scorer.py
+│   ├── test_spatial_memory.py
+│   ├── test_wall_follower_unit.py
+│   └── test_waypoint_planner_unit.py
+├── models/                     # saved_model.pkl, scaler.pkl
+├── data/                       # training_data.csv
+├── assets/                     # robot.png, robot_inverse.png, demo.gif
+├── requirements.txt
+├── CLAUDE.md
+└── README.md
+```
+
+---
+
+## Performance Characteristics
+
+Measured on the default simulation (1080 × 900 px, random obstacle layout, sensor range 150 px, action repeat 20):
+
+| Metric                        | Value                      |
+|-------------------------------|----------------------------|
+| Goal-reach success rate       | 75–80%                     |
+| Avg iterations per goal       | 800–1300                   |
+| Collision rate in training data | ~10%                     |
+| Sensor range                  | 150 px                     |
+| Action space                  | 11 discrete values, `[−5, +5]` |
+| Action repeat                 | 20 physics steps / decision|
+| Training time (100 epochs)    | ~5–10 min on CPU / MPS     |
+| Inference per decision        | 11 forward passes (× 10 MC samples if uncertainty enabled) |
+
+The controller is deterministic given fixed RNG seeds in both PyMunk and NumPy; MC Dropout is the sole source of inference-time stochasticity.
+
+---
+
+![demo](assets/demo.gif)
